@@ -22,9 +22,7 @@ try {
   console.error('Cannot load config.json:', e.message);
   process.exit(1);
 }
-if (process.env.TARGET_ADDON_BASES) {
-  rawBases = process.env.TARGET_ADDON_BASES.split(',');
-}
+if (process.env.TARGET_ADDON_BASES) rawBases = process.env.TARGET_ADDON_BASES.split(',');
 
 // Normalize base URLs: remove manifest.json and trailing slashes
 const bases = rawBases
@@ -81,30 +79,32 @@ app.get('/manifest.json', (req, res) => {
 
 // POST proxy helper for V4 requests
 async function broadcastPost(path, body) {
-  const calls = bases.map(b =>
-    axios
-      .post(`${b}/${path}`, body, { headers: { 'Content-Type': 'application/json' } })
-      .then(r => r.data)
-      .catch(err => {
-        console.warn(`POST ${path} failed for ${b}: ${err.message}`);
-        return null;
-      })
+  return Promise.all(
+    bases.map(b =>
+      axios
+        .post(`${b}/${path}`, body, { headers: { 'Content-Type': 'application/json' } })
+        .then(r => r.data)
+        .catch(err => {
+          console.warn(`POST ${path} failed for ${b}: ${err.message}`);
+          return null;
+        })
+    )
   );
-  return Promise.all(calls);
 }
 
 // GET proxy helper for V3 requests
 async function broadcastGet(path) {
-  const calls = bases.map(b =>
-    axios
-      .get(`${b}/${path}`)
-      .then(r => r.data)
-      .catch(err => {
-        console.warn(`GET ${path} failed for ${b}: ${err.message}`);
-        return null;
-      })
+  return Promise.all(
+    bases.map(b =>
+      axios
+        .get(`${b}/${path}`)
+        .then(r => r.data)
+        .catch(err => {
+          console.warn(`GET ${path} failed for ${b}: ${err.message}`);
+          return null;
+        })
+    )
   );
-  return Promise.all(calls);
 }
 
 // V4 Catalog
@@ -136,11 +136,19 @@ app.post('/stream', async (req, res) => {
   res.json({ streams });
 });
 
-// V4 Subtitles
+// V4 Subtitles with GET fallback
 app.post('/subtitles', async (req, res) => {
-  const responses = await broadcastPost('subtitles', req.body);
-  console.log('Subtitles raw responses:', responses);
-  const subtitles = responses.reduce((a, r) => (r && Array.isArray(r.subtitles) ? a.concat(r.subtitles) : a), []);
+  // Try POST first
+  const postResponses = await broadcastPost('subtitles', req.body);
+  console.log('Subtitles raw responses (POST):', postResponses);
+  let subtitles = postResponses.reduce((a, r) => (r && Array.isArray(r.subtitles) ? a.concat(r.subtitles) : a), []);
+  // Fallback to GET if POST yields none
+  if (subtitles.length === 0) {
+    const path = `subtitles/${req.body.type}/${req.body.id}.json`;
+    const getResponses = await broadcastGet(path);
+    console.log('Subtitles raw responses (GET):', getResponses);
+    subtitles = getResponses.reduce((a, r) => (r && Array.isArray(r.subtitles) ? a.concat(r.subtitles) : a), []);
+  }
   res.json({ subtitles });
 });
 
@@ -153,7 +161,7 @@ app.get('/catalog/:type/:id.json', async (req, res) => {
   res.json({ metas });
 });
 
-// V3 GET Catalog with extra (e.g., /genre=...)
+// V3 GET Catalog with extra
 app.get('/catalog/:type/:id/:extra.json', async (req, res) => {
   const { type, id, extra } = req.params;
   const responses = await broadcastGet(`catalog/${type}/${id}/${extra}.json`);
