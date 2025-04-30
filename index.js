@@ -13,7 +13,7 @@ app.use((req, res, next) => {
 });
 app.use(express.json());
 
-// Load target addon bases from config or env
+// Load target addon bases from config or environment
 let rawBases = [];
 try {
   const cfg = JSON.parse(fs.readFileSync('./config.json'));
@@ -26,10 +26,10 @@ if (process.env.TARGET_ADDON_BASES) {
   rawBases = process.env.TARGET_ADDON_BASES.split(',');
 }
 
-// Normalize bases: strip '/manifest.json' and trailing slashes
+// Normalize base URLs: remove manifest.json and trailing slashes
 const bases = rawBases
-  .map(b => b.trim())
-  .map(u => u.endsWith('/manifest.json') ? u.slice(0, -'/manifest.json'.length) : u)
+  .map(u => u.trim())
+  .map(u => u.replace(/\/manifest\.json$/i, ''))
   .map(u => u.replace(/\/+$/, ''))
   .filter(u => u);
 
@@ -38,13 +38,11 @@ if (bases.length === 0) {
   process.exit(1);
 }
 
-// Build wrapper manifest from all fetched manifests
+// Build the wrapper manifest by fetching each addon manifest
 async function buildWrapperManifest() {
-  const results = await Promise.allSettled(
-    bases.map(b => axios.get(`${b}/manifest.json`))
-  );
+  const results = await Promise.allSettled(bases.map(b => axios.get(`${b}/manifest.json`)));
   const manifests = results
-    .map((r, i) => r.status === 'fulfilled' ? r.value.data : null)
+    .map(r => (r.status === 'fulfilled' ? r.value.data : null))
     .filter(m => m);
   if (manifests.length === 0) {
     console.error('No valid manifests fetched, aborting');
@@ -81,37 +79,35 @@ app.get('/manifest.json', (req, res) => {
   res.json(wrapperManifest);
 });
 
-// POST proxy helper (V4)
+// POST proxy helper for V4 requests
 async function broadcastPost(path, body) {
-  return Promise.all(
-    bases.map(b =>
-      axios
-        .post(`${b}/${path}`, body, { headers: { 'Content-Type': 'application/json' } })
-        .then(r => r.data)
-        .catch(err => {
-          console.warn(`POST ${path} failed for ${b}: ${err.message}`);
-          return null;
-        })
-    )
+  const calls = bases.map(b =>
+    axios
+      .post(`${b}/${path}`, body, { headers: { 'Content-Type': 'application/json' } })
+      .then(r => r.data)
+      .catch(err => {
+        console.warn(`POST ${path} failed for ${b}: ${err.message}`);
+        return null;
+      })
   );
+  return Promise.all(calls);
 }
 
-// GET proxy helper (V3)
+// GET proxy helper for V3 requests
 async function broadcastGet(path) {
-  return Promise.all(
-    bases.map(b =>
-      axios
-        .get(`${b}/${path}`)
-        .then(r => r.data)
-        .catch(err => {
-          console.warn(`GET ${path} failed for ${b}: ${err.message}`);
-          return null;
-        })
-    )
+  const calls = bases.map(b =>
+    axios
+      .get(`${b}/${path}`)
+      .then(r => r.data)
+      .catch(err => {
+        console.warn(`GET ${path} failed for ${b}: ${err.message}`);
+        return null;
+      })
   );
+  return Promise.all(calls);
 }
 
-// Catalog V4
+// V4 Catalog
 app.post('/catalog', async (req, res) => {
   const responses = await broadcastPost('catalog', req.body);
   console.log('Catalog raw responses:', responses);
@@ -119,7 +115,7 @@ app.post('/catalog', async (req, res) => {
   res.json({ metas });
 });
 
-// Meta V4
+// V4 Meta
 app.post('/meta', async (req, res) => {
   const responses = await broadcastPost('meta', req.body);
   console.log('Meta raw responses:', responses);
@@ -132,7 +128,7 @@ app.post('/meta', async (req, res) => {
   res.json({ metas });
 });
 
-// Stream V4
+// V4 Stream
 app.post('/stream', async (req, res) => {
   const responses = await broadcastPost('stream', req.body);
   console.log('Stream raw responses:', responses);
@@ -140,7 +136,7 @@ app.post('/stream', async (req, res) => {
   res.json({ streams });
 });
 
-// Subtitles V4
+// V4 Subtitles
 app.post('/subtitles', async (req, res) => {
   const responses = await broadcastPost('subtitles', req.body);
   console.log('Subtitles raw responses:', responses);
@@ -148,7 +144,7 @@ app.post('/subtitles', async (req, res) => {
   res.json({ subtitles });
 });
 
-// GET V3 /catalog/:type/:id.json
+// V3 GET Catalog
 app.get('/catalog/:type/:id.json', async (req, res) => {
   const { type, id } = req.params;
   const responses = await broadcastGet(`catalog/${type}/${id}.json`);
@@ -157,7 +153,7 @@ app.get('/catalog/:type/:id.json', async (req, res) => {
   res.json({ metas });
 });
 
-// GET V3 /catalog/:type/:id/:extra.json
+// V3 GET Catalog with extra (e.g., /genre=...)
 app.get('/catalog/:type/:id/:extra.json', async (req, res) => {
   const { type, id, extra } = req.params;
   const responses = await broadcastGet(`catalog/${type}/${id}/${extra}.json`);
@@ -166,7 +162,25 @@ app.get('/catalog/:type/:id/:extra.json', async (req, res) => {
   res.json({ metas });
 });
 
-// Redirect root to manifest
+// V3 GET Stream
+app.get('/stream/:type/:id.json', async (req, res) => {
+  const { type, id } = req.params;
+  const responses = await broadcastGet(`stream/${type}/${id}.json`);
+  console.log('Stream GET raw responses:', responses);
+  const streams = responses.reduce((a, r) => (r && Array.isArray(r.streams) ? a.concat(r.streams) : a), []);
+  res.json({ streams });
+});
+
+// V3 GET Subtitles
+app.get('/subtitles/:type/:id.json', async (req, res) => {
+  const { type, id } = req.params;
+  const responses = await broadcastGet(`subtitles/${type}/${id}.json`);
+  console.log('Subtitles GET raw responses:', responses);
+  const subs = responses.reduce((a, r) => (r && Array.isArray(r.subtitles) ? a.concat(r.subtitles) : a), []);
+  res.json({ subtitles: subs });
+});
+
+// Redirect root
 app.get('/', (req, res) => res.redirect('/manifest.json'));
 
 // Start server
