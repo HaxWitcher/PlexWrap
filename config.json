@@ -1,0 +1,13 @@
+{
+  "TARGET_ADDON_BASES": [
+    // 1.
+    "https://1fe84bc728af-stremio-mdblist.baby-beamup.club/filmovi-2025/userapi-haxwitcher-qnyima1bbkfwlf2acap4wsidw",
+    // 2.
+    "stremio://1fe84bc728af-stremio-mdblist.baby-beamup.club/serije-sa-originalnim-prevodom/userapi-haxwitcher-qnyima1bbkfwlf2acap4wsidw",
+    // 3.
+    "https://haxwitcher-aiostreams.elfhosted.com/debrid1",
+    // …
+    // Dodajte ih koliko god želite (10+)
+    "https://deseti-addon-url.com"
+  ]
+}
