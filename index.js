@@ -36,12 +36,38 @@ if (bases.length === 0) {
   process.exit(1);
 }
 
-// Build the wrapper manifest by fetching each addon manifest
+// Helper: proxy GET to each base
+async function broadcastGet(path) {
+  console.log(`Proxy GET path: ${path}`);
+  const calls = bases.map(b =>
+    axios.get(`${b}/${path}`)
+      .then(r => r.data)
+      .catch(err => {
+        console.warn(`GET ${path} failed for ${b}: ${err.message}`);
+        return null;
+      })
+  );
+  return Promise.all(calls);
+}
+
+// Helper: proxy POST to each base
+async function broadcastPost(path, body) {
+  console.log(`Proxy POST path: ${path}, body:`, body);
+  const calls = bases.map(b =>
+    axios.post(`${b}/${path}`, body, { headers: { 'Content-Type': 'application/json' } })
+      .then(r => r.data)
+      .catch(err => {
+        console.warn(`POST ${path} failed for ${b}: ${err.message}`);
+        return null;
+      })
+  );
+  return Promise.all(calls);
+}
+
+// Build wrapper manifest by fetching each addon's manifest.json
 async function buildWrapperManifest() {
   const results = await Promise.allSettled(bases.map(b => axios.get(`${b}/manifest.json`)));
-  const manifests = results
-    .map(r => (r.status === 'fulfilled' ? r.value.data : null))
-    .filter(m => m);
+  const manifests = results.map(r => (r.status === 'fulfilled' ? r.value.data : null)).filter(m => m);
   if (manifests.length === 0) {
     console.error('No valid manifests fetched, aborting');
     process.exit(1);
@@ -60,6 +86,7 @@ async function buildWrapperManifest() {
   };
 }
 
+// Initialize wrapper manifest
 let wrapperManifest;
 buildWrapperManifest()
   .then(man => {
@@ -71,52 +98,22 @@ buildWrapperManifest()
     process.exit(1);
   });
 
-// Serve manifest
+// Serve manifest.json
 app.get('/manifest.json', (req, res) => {
-  if (!wrapperManifest) return res.status(503).json({ error: 'Manifest not ready' });
+  if (!wrapperManifest) {
+    return res.status(503).json({ error: 'Manifest not ready' });
+  }
   res.json(wrapperManifest);
 });
 
-// POST proxy helper for V4 requests
-async function broadcastPost(path, body) {
-  const calls = bases.map(b =>
-    axios
-      .post(`${b}/${path}`, body, { headers: { 'Content-Type': 'application/json' } })
-      .then(r => r.data)
-      .catch(err => {
-        console.warn(`POST ${path} failed for ${b}: ${err.message}`);
-        return null;
-      })
-  );
-  return Promise.all(calls);
-}
-
-// GET proxy helper for V3 requests
-async function broadcastGet(path) {
-  const calls = bases.map(b =>
-    axios
-      .get(`${b}/${path}`)
-      .then(r => r.data)
-      .catch(err => {
-        console.warn(`GET ${path} failed for ${b}: ${err.message}`);
-        return null;
-      })
-  );
-  return Promise.all(calls);
-}
-
-// V4 Catalog
+// V4 endpoints
 app.post('/catalog', async (req, res) => {
   const responses = await broadcastPost('catalog', req.body);
-  console.log('Catalog raw responses:', responses);
   const metas = responses.reduce((a, r) => (r && Array.isArray(r.metas) ? a.concat(r.metas) : a), []);
   res.json({ metas });
 });
-
-// V4 Meta
 app.post('/meta', async (req, res) => {
   const responses = await broadcastPost('meta', req.body);
-  console.log('Meta raw responses:', responses);
   const metas = [];
   responses.forEach(r => {
     if (!r) return;
@@ -125,70 +122,34 @@ app.post('/meta', async (req, res) => {
   });
   res.json({ metas });
 });
-
-// V4 Stream
 app.post('/stream', async (req, res) => {
   const responses = await broadcastPost('stream', req.body);
-  console.log('Stream raw responses:', responses);
   const streams = responses.reduce((a, r) => (r && Array.isArray(r.streams) ? a.concat(r.streams) : a), []);
   res.json({ streams });
 });
-
-// V4 Subtitles (POST)
 app.post('/subtitles', async (req, res) => {
   const responses = await broadcastPost('subtitles', req.body);
-  console.log('Subtitles POST raw responses:', responses);
-  const subtitles = responses.reduce((a, r) => (r && Array.isArray(r.subtitles) ? a.concat(r.subtitles) : a), []);
-  res.json({ subtitles });
-});
-
-// V3 GET Catalog
-app.get('/catalog/:type/:id.json', async (req, res) => {
-  const { type, id } = req.params;
-  const responses = await broadcastGet(`catalog/${type}/${id}.json`);
-  console.log('Catalog GET raw responses:', responses);
-  const metas = responses.reduce((a, r) => (r && Array.isArray(r.metas) ? a.concat(r.metas) : a), []);
-  res.json({ metas });
-});
-
-// V3 GET Catalog with extra
-app.get('/catalog/:type/:id/:extra.json', async (req, res) => {
-  const { type, id, extra } = req.params;
-  const responses = await broadcastGet(`catalog/${type}/${id}/${extra}.json`);
-  console.log('Catalog Extra GET raw responses:', responses);
-  const metas = responses.reduce((a, r) => (r && Array.isArray(r.metas) ? a.concat(r.metas) : a), []);
-  res.json({ metas });
-});
-
-// V3 GET Stream
-app.get('/stream/:type/:id.json', async (req, res) => {
-  const { type, id } = req.params;
-  const responses = await broadcastGet(`stream/${type}/${id}.json`);
-  console.log('Stream GET raw responses:', responses);
-  const streams = responses.reduce((a, r) => (r && Array.isArray(r.streams) ? a.concat(r.streams) : a), []);
-  res.json({ streams });
-});
-
-// V3 GET Subtitles simple
-app.get('/subtitles/:type/:id.json', async (req, res) => {
-  const { type, id } = req.params;
-  const responses = await broadcastGet(`subtitles/${type}/${id}.json`);
-  console.log('Subtitles GET raw responses (simple):', responses);
   const subs = responses.reduce((a, r) => (r && Array.isArray(r.subtitles) ? a.concat(r.subtitles) : a), []);
   res.json({ subtitles: subs });
 });
 
-// V3 GET Subtitles with extra
-app.get('/subtitles/:type/:id/:extra.json', async (req, res) => {
-  const { type, id, extra } = req.params;
-  const responses = await broadcastGet(`subtitles/${type}/${id}/${extra}.json`);
-  console.log('Subtitles GET raw responses (extra):', responses);
-  const subs = responses.reduce((a, r) => (r && Array.isArray(r.subtitles) ? a.concat(r.subtitles) : a), []);
-  res.json({ subtitles: subs });
+// Catch-all GET proxy for V3 compatibility (handles catalog, stream, subtitles)
+app.get('/*', async (req, res) => {
+  const path = req.path.replace(/^\//, '');
+  const responses = await broadcastGet(path);
+  const key = /\/catalog\//.test(path)
+    ? 'metas'
+    : /\/stream\//.test(path)
+    ? 'streams'
+    : /\/subtitles\//.test(path)
+    ? 'subtitles'
+    : null;
+  if (!key) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  const combined = responses.reduce((a, r) => (r && Array.isArray(r[key]) ? a.concat(r[key]) : a), []);
+  res.json({ [key]: combined });
 });
-
-// Redirect root
-app.get('/', (req, res) => res.redirect('/manifest.json'));
 
 // Start server
 const PORT = process.env.PORT || 7000;
