@@ -2,6 +2,18 @@ const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
 const app = express();
+
+// Omogućavamo CORS za Stremio
+app.use((req, res, next) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 app.use(express.json());
 
 // Učitavamo sve ciljne baze iz config.json ili iz Heroku ENV varijable
