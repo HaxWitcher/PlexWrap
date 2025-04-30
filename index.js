@@ -3,7 +3,7 @@ const axios = require('axios');
 const fs = require('fs');
 const app = express();
 
-// Omogućavamo CORS za Stremio
+// Omogućavamo CORS za Stremio klijenta
 app.use((req, res, next) => {
   res.set('Access-Control-Allow-Origin', '*');
   res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
-// Učitavamo sve ciljne baze iz config.json ili iz Heroku ENV varijable
+// Učitavamo ciljne addon baze iz config.json ili iz Heroku ENV
 let bases = [];
 try {
   const cfg = JSON.parse(fs.readFileSync('./config.json'));
@@ -33,30 +33,24 @@ if (!Array.isArray(bases) || bases.length === 0) {
   process.exit(1);
 }
 
-// Funkcija za izgradnju wrapper manifest-a, ignorira neispravne baze
+// Dohvat i izgradnja wrapper manifest-a (ignore neuspjele)
 async function buildWrapperManifest() {
   const results = await Promise.allSettled(
     bases.map(b => axios.get(`${b.replace(/\/$/, '')}/manifest.json`))
   );
   const manifests = results
-    .map((res, idx) => {
-      if (res.status === 'fulfilled') return res.value.data;
-      console.warn(`Manifest fetch failed for ${bases[idx]}: ${res.reason.message}`);
-      return null;
-    })
+    .map((res, idx) => res.status === 'fulfilled' ? res.value.data : null)
     .filter(m => m);
-
   if (manifests.length === 0) {
-    console.error('Nijedan validan manifest nije dohvaćen. Prekidam izvođenje.');
+    console.error('Nijedan validan manifest nije dohvaćen. Prekidam.');
     process.exit(1);
   }
-
   return {
     id: 'stremio-proxy-wrapper',
     version: '1.0.0',
     name: 'Stremio Proxy Wrapper',
     description: 'Proxy svih vaših Stremio addon-a',
-    resources: ['catalog', 'meta', 'stream', 'subtitles'],
+    resources: ['catalog','meta','stream','subtitles'],
     types: [...new Set(manifests.flatMap(m => m.types || []))],
     idPrefixes: [...new Set(manifests.flatMap(m => m.idPrefixes || []))],
     catalogs: manifests.flatMap(m => m.catalogs || []),
@@ -66,41 +60,36 @@ async function buildWrapperManifest() {
 }
 
 let wrapperManifest;
-buildWrapperManifest()
-  .then(manifest => {
-    wrapperManifest = manifest;
-    console.log(`Wrapper manifest je spreman (uspješno dohvaćeno ${wrapperManifest.catalogs.length} stavki).`);
-  })
-  .catch(err => {
-    console.error('Greška pri izgradnji wrapper manifest-a:', err.message);
-    process.exit(1);
-  });
+buildWrapperManifest().then(manifest => {
+  wrapperManifest = manifest;
+  console.log(`Wrapper manifest spreman, dohvaćeno ${wrapperManifest.catalogs.length} katalog stavki.`);
+}).catch(err => {
+  console.error('Greška pri izgradnji manifest-a:', err.message);
+  process.exit(1);
+});
 
-// Serviranje wrapper manifest-a
+// Serviranje manifest.json
 app.get('/manifest.json', (req, res) => {
-  if (!wrapperManifest) {
-    return res.status(503).json({ error: 'Manifest još nije spreman, probajte kasnije.' });
-  }
+  if (!wrapperManifest) return res.status(503).json({ error: 'Manifest još nije spreman.' });
   res.json(wrapperManifest);
 });
 
-// Fan-out POST proxy
+// Fan-out helper za POST
 async function broadcastPost(path, body) {
-  const calls = bases.map(b => {
-    const url = `${b.replace(/\/$/, '')}/${path}`;
-    return axios.post(url, body, { headers: { 'Content-Type': 'application/json' } })
+  return Promise.all(
+    bases.map(b => axios.post(`${b.replace(/\/$/, '')}/${path}`, body, { headers: { 'Content-Type': 'application/json' } })
       .then(r => r.data)
       .catch(err => {
-        console.warn(`Proxy POST failed for ${url}: ${err.message}`);
+        console.warn(`Proxy POST failed for ${b}/${path}: ${err.message}`);
         return null;
-      });
-  });
-  return Promise.all(calls);
+      })
+    )
+  );
 }
 
-// Endpoints
-app.post('/catalog/:type', async (req, res) => {
-  const responses = await broadcastPost(`catalog/${req.params.type}`, req.body);
+// Katalog endpoint za V4 spec: POST /catalog
+app.post('/catalog', async (req, res) => {
+  const responses = await broadcastPost('catalog', req.body);
   const metas = responses.reduce((acc, r) => {
     if (r && Array.isArray(r.metas)) acc.push(...r.metas);
     return acc;
@@ -108,6 +97,7 @@ app.post('/catalog/:type', async (req, res) => {
   res.json({ metas });
 });
 
+// Meta endpoint: POST /meta
 app.post('/meta', async (req, res) => {
   const responses = await broadcastPost('meta', req.body);
   const metas = [];
@@ -119,6 +109,7 @@ app.post('/meta', async (req, res) => {
   res.json({ metas });
 });
 
+// Stream endpoint: POST /stream
 app.post('/stream', async (req, res) => {
   const responses = await broadcastPost('stream', req.body);
   const streams = responses.reduce((acc, r) => {
@@ -128,18 +119,19 @@ app.post('/stream', async (req, res) => {
   res.json({ streams });
 });
 
+// Subtitles endpoint: POST /subtitles
 app.post('/subtitles', async (req, res) => {
   const responses = await broadcastPost('subtitles', req.body);
-  const subtitles = responses.reduce((acc, r) => {
+  const subs = responses.reduce((acc, r) => {
     if (r && Array.isArray(r.subtitles)) acc.push(...r.subtitles);
     return acc;
   }, []);
-  res.json({ subtitles });
+  res.json({ subtitles: subs });
 });
 
-// Opcionalno: redirekt za root
+// Redirect root
 app.get('/', (req, res) => res.redirect('/manifest.json'));
 
-// Start server
+// Pokretanje servera
 const PORT = process.env.PORT || 7000;
 app.listen(PORT, () => console.log(`Proxy addon sluša na portu ${PORT}`));
