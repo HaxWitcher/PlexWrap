@@ -3,7 +3,7 @@ const axios = require('axios');
 const fs = require('fs');
 const app = express();
 
-// CORS middleware for Stremio
+// Enable CORS for Stremio
 app.use((req, res, next) => {
   res.set('Access-Control-Allow-Origin', '*');
   res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
@@ -13,7 +13,7 @@ app.use((req, res, next) => {
 });
 app.use(express.json());
 
-// Load target addon bases from config or environment
+// Load TARGET_ADDON_BASES from config or env
 let rawBases = [];
 try {
   const cfg = JSON.parse(fs.readFileSync('./config.json'));
@@ -24,52 +24,43 @@ try {
 }
 if (process.env.TARGET_ADDON_BASES) rawBases = process.env.TARGET_ADDON_BASES.split(',');
 
-// Normalize base URLs: remove manifest.json and trailing slashes
+// Normalize base URLs
 const bases = rawBases
   .map(u => u.trim())
   .map(u => u.replace(/\/manifest\.json$/i, ''))
   .map(u => u.replace(/\/+$/, ''))
   .filter(u => u);
-
 if (bases.length === 0) {
   console.error('No valid TARGET_ADDON_BASES provided');
   process.exit(1);
 }
 
-// Helper: proxy GET to each base
+// Broadcast GET helper
 async function broadcastGet(path) {
-  console.log(`Proxy GET path: ${path}`);
   const calls = bases.map(b =>
     axios.get(`${b}/${path}`)
       .then(r => r.data)
-      .catch(err => {
-        console.warn(`GET ${path} failed for ${b}: ${err.message}`);
-        return null;
-      })
+      .catch(() => null)
   );
   return Promise.all(calls);
 }
 
-// Helper: proxy POST to each base
+// Broadcast POST helper
 async function broadcastPost(path, body) {
-  console.log(`Proxy POST path: ${path}, body:`, body);
   const calls = bases.map(b =>
     axios.post(`${b}/${path}`, body, { headers: { 'Content-Type': 'application/json' } })
       .then(r => r.data)
-      .catch(err => {
-        console.warn(`POST ${path} failed for ${b}: ${err.message}`);
-        return null;
-      })
+      .catch(() => null)
   );
   return Promise.all(calls);
 }
 
-// Build wrapper manifest by fetching each addon's manifest.json
+// Build wrapper manifest
 async function buildWrapperManifest() {
   const results = await Promise.allSettled(bases.map(b => axios.get(`${b}/manifest.json`)));
-  const manifests = results.map(r => (r.status === 'fulfilled' ? r.value.data : null)).filter(m => m);
-  if (manifests.length === 0) {
-    console.error('No valid manifests fetched, aborting');
+  const manifests = results.map(r => r.status === 'fulfilled' ? r.value.data : null).filter(Boolean);
+  if (!manifests.length) {
+    console.error('No valid manifests fetched');
     process.exit(1);
   }
   return {
@@ -86,68 +77,59 @@ async function buildWrapperManifest() {
   };
 }
 
-// Initialize wrapper manifest
 let wrapperManifest;
-buildWrapperManifest()
-  .then(man => {
-    wrapperManifest = man;
-    console.log(`Wrapper manifest built with ${man.catalogs.length} catalog entries`);
-  })
-  .catch(err => {
-    console.error('Error building manifest:', err.message);
-    process.exit(1);
-  });
+buildWrapperManifest().then(m => {
+  wrapperManifest = m;
+  console.log(`Wrapper manifest built with ${m.catalogs.length} catalog entries`);
+}).catch(e => {
+  console.error('Error building manifest:', e.message);
+  process.exit(1);
+});
 
-// Serve manifest.json
+// Serve manifest
 app.get('/manifest.json', (req, res) => {
-  if (!wrapperManifest) {
-    return res.status(503).json({ error: 'Manifest not ready' });
-  }
+  if (!wrapperManifest) return res.status(503).json({ error: 'Manifest not ready' });
   res.json(wrapperManifest);
 });
 
 // V4 endpoints
 app.post('/catalog', async (req, res) => {
   const responses = await broadcastPost('catalog', req.body);
-  const metas = responses.reduce((a, r) => (r && Array.isArray(r.metas) ? a.concat(r.metas) : a), []);
+  const metas = responses.reduce((acc, r) => (r && Array.isArray(r.metas) ? acc.concat(r.metas) : acc), []);
   res.json({ metas });
 });
 app.post('/meta', async (req, res) => {
   const responses = await broadcastPost('meta', req.body);
   const metas = [];
   responses.forEach(r => {
-    if (!r) return;
-    if (r.meta) metas.push(r.meta);
-    if (Array.isArray(r.metas)) metas.push(...r.metas);
+    if (r && r.meta) metas.push(r.meta);
+    if (r && Array.isArray(r.metas)) metas.push(...r.metas);
   });
   res.json({ metas });
 });
 app.post('/stream', async (req, res) => {
   const responses = await broadcastPost('stream', req.body);
-  const streams = responses.reduce((a, r) => (r && Array.isArray(r.streams) ? a.concat(r.streams) : a), []);
+  const streams = responses.reduce((acc, r) => (r && Array.isArray(r.streams) ? acc.concat(r.streams) : acc), []);
   res.json({ streams });
 });
 app.post('/subtitles', async (req, res) => {
   const responses = await broadcastPost('subtitles', req.body);
-  const subs = responses.reduce((a, r) => (r && Array.isArray(r.subtitles) ? a.concat(r.subtitles) : a), []);
+  const subs = responses.reduce((acc, r) => (r && Array.isArray(r.subtitles) ? acc.concat(r.subtitles) : acc), []);
   res.json({ subtitles: subs });
 });
 
-// Catch-all GET proxy for V3 compatibility (handles catalog, stream, subtitles)
-app.get('/*', async (req, res) => {
-  const path = req.path.replace(/^\//, '');
+// Catch-all GET proxy for V3 compatibility
+app.get('*', async (req, res) => {
+  const urlPath = req.path;
+  let key;
+  if (urlPath.startsWith('/catalog/')) key = 'metas';
+  else if (urlPath.startsWith('/stream/')) key = 'streams';
+  else if (urlPath.startsWith('/subtitles/')) key = 'subtitles';
+  else return res.status(404).json({ error: 'Not found' });
+
+  const path = urlPath.slice(1); // remove leading slash
   const responses = await broadcastGet(path);
-  const key = /\/catalog\//.test(path)
-    ? 'metas'
-    : /\/stream\//.test(path)
-    ? 'streams'
-    : /\/subtitles\//.test(path)
-    ? 'subtitles'
-    : null;
-  if (!key) {
-    return res.status(404).json({ error: 'Not found' });
-  }
-  const combined = responses.reduce((a, r) => (r && Array.isArray(r[key]) ? a.concat(r[key]) : a), []);
+  const combined = responses.reduce((acc, r) => (r && Array.isArray(r[key]) ? acc.concat(r[key]) : acc), []);
   res.json({ [key]: combined });
 });
 
