@@ -30,16 +30,17 @@ if (!bases.length) {
 }
 
 // Load allowed API tokens from environment
-// Comma-separated list of tokens, e.g. "token123,token456"
 const ALLOWED_TOKENS = (process.env.ACCESS_TOKENS || '').split(',').map(t => t.trim()).filter(Boolean);
 if (!ALLOWED_TOKENS.length) {
   console.error('ACCESS_TOKENS not set or empty');
   process.exit(1);
 }
 
-// Middleware to require token for all requests except manifest.json
+// Middleware: allow manifest and configure endpoints without token
 app.use((req, res, next) => {
-  if (req.path === '/manifest.json') return next();
+  if (req.path === '/manifest.json' || req.path === '/configure') {
+    return next();
+  }
   // Token can be sent in POST body under config or as query parameter
   let token = req.body?.config?.token;
   if (!token) token = req.query.token;
@@ -49,41 +50,33 @@ app.use((req, res, next) => {
   next();
 });
 
-// Helpers to broadcast requests to all addon bases
+// Broadcast GET helper
 async function broadcastGet(path) {
-  const calls = bases.map(b => axios.get(`${b}/${path}`).then(r => r.data).catch(() => null));
-  return Promise.all(calls);
-}
-async function broadcastPost(path, body) {
-  const calls = bases.map(b => axios.post(`${b}/${path}`, body, { headers: { 'Content-Type': 'application/json' } }).then(r => r.data).catch(() => null));
+  const calls = bases.map(b =>
+    axios.get(`${b}/${path}`).then(r => r.data).catch(() => null)
+  );
   return Promise.all(calls);
 }
 
-// Build proxy wrapper manifest with behaviorHints and config
+// Broadcast POST helper
+async function broadcastPost(path, body) {
+  const calls = bases.map(b =>
+    axios.post(`${b}/${path}`, body, { headers: { 'Content-Type': 'application/json' } }).then(r => r.data).catch(() => null)
+  );
+  return Promise.all(calls);
+}
+
+// Build wrapper manifest
 async function buildWrapperManifest() {
   const results = await Promise.allSettled(bases.map(b => axios.get(`${b}/manifest.json`)));
-  const manifests = results.map(r => (r.status === 'fulfilled' ? r.value.data : null)).filter(Boolean);
-  if (!manifests.length) {
-    console.error('No valid manifests fetched, aborting');
-    process.exit(1);
-  }
+  const manifests = results.map(r => r.status === 'fulfilled' ? r.value.data : null).filter(Boolean);
   return {
     id: 'stremio-proxy-wrapper',
     version: '1.0.0',
     name: 'Stremio Proxy Wrapper',
     description: 'Proxy svih vaših Stremio addon-a',
-    behaviorHints: {
-      configurable: true,
-      configurationRequired: true
-    },
-    config: [
-      {
-        key: 'token',
-        title: 'Access Token',
-        type: 'password',
-        required: true
-      }
-    ],
+    behaviorHints: { configurable: true, configurationRequired: true },
+    config: [{ key: 'token', title: 'Access Token', type: 'password', required: true }],
     resources: ['catalog', 'meta', 'stream', 'subtitles'],
     types: [...new Set(manifests.flatMap(m => m.types || []))],
     idPrefixes: [...new Set(manifests.flatMap(m => m.idPrefixes || []))],
@@ -98,14 +91,18 @@ buildWrapperManifest().then(man => {
   wrapperManifest = man;
   console.log(`Wrapper manifest built with ${man.catalogs.length} catalog entries`);
 }).catch(err => {
-  console.error('Error building manifest:', err.message);
+  console.error('Error:', err.message);
   process.exit(1);
 });
 
-// Serve manifest.json
+// Serve manifest and configure endpoints
 app.get('/manifest.json', (req, res) => {
   if (!wrapperManifest) return res.status(503).json({ error: 'Manifest not ready' });
   res.json(wrapperManifest);
+});
+app.get('/configure', (req, res) => {
+  if (!wrapperManifest) return res.status(503).json({ error: 'Manifest not ready' });
+  res.json(wrapperManifest.config);
 });
 
 // V4 endpoints
@@ -134,9 +131,9 @@ app.post('/subtitles', async (req, res) => {
   res.json({ subtitles: subs });
 });
 
-// Catch-all GET proxy for V3 compatibility
+// Catch-all GET proxy
 app.get('*', async (req, res) => {
-  const path = req.path.slice(1); // remove leading slash
+  const path = req.path.slice(1);
   let key;
   if (path.startsWith('catalog/')) key = 'metas';
   else if (path.startsWith('stream/')) key = 'streams';
