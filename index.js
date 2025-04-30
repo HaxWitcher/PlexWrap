@@ -11,64 +11,58 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
+
 app.use(express.json());
 
-// Load TARGET_ADDON_BASES from config or env
-let rawBases = [];
+// Load target addon bases
+let rawBases;
 try {
-  const cfg = JSON.parse(fs.readFileSync('./config.json'));
-  rawBases = cfg.TARGET_ADDON_BASES;
+  rawBases = JSON.parse(fs.readFileSync('./config.json')).TARGET_ADDON_BASES;
 } catch (e) {
   console.error('Cannot load config.json:', e.message);
   process.exit(1);
 }
-if (process.env.TARGET_ADDON_BASES) rawBases = process.env.TARGET_ADDON_BASES.split(',');
-
-// Normalize base URLs
+if (process.env.TARGET_ADDON_BASES) {
+  rawBases = process.env.TARGET_ADDON_BASES.split(',');
+}
 const bases = rawBases
-  .map(u => u.trim())
-  .map(u => u.replace(/\/manifest\.json$/i, ''))
-  .map(u => u.replace(/\/+$/, ''))
-  .filter(u => u);
-if (bases.length === 0) {
+  .map(u => u.trim().replace(/\/manifest\.json$/i, '').replace(/\/+$/, ''))
+  .filter(Boolean);
+if (!bases.length) {
   console.error('No valid TARGET_ADDON_BASES provided');
   process.exit(1);
 }
 
-// Broadcast GET helper
-async function broadcastGet(path) {
-  const calls = bases.map(b =>
-    axios.get(`${b}/${path}`)
-      .then(r => r.data)
-      .catch(() => null)
+// Fetch and store each base's manifest
+const baseManifests = [];
+async function initBaseManifests() {
+  const results = await Promise.allSettled(
+    bases.map(b => axios.get(`${b}/manifest.json`))
   );
-  return Promise.all(calls);
-}
-
-// Broadcast POST helper
-async function broadcastPost(path, body) {
-  const calls = bases.map(b =>
-    axios.post(`${b}/${path}`, body, { headers: { 'Content-Type': 'application/json' } })
-      .then(r => r.data)
-      .catch(() => null)
-  );
-  return Promise.all(calls);
-}
-
-// Build wrapper manifest
-async function buildWrapperManifest() {
-  const results = await Promise.allSettled(bases.map(b => axios.get(`${b}/manifest.json`)));
-  const manifests = results.map(r => r.status === 'fulfilled' ? r.value.data : null).filter(Boolean);
-  if (!manifests.length) {
-    console.error('No valid manifests fetched');
+  results.forEach((r, idx) => {
+    if (r.status === 'fulfilled' && r.value.data.catalogs) {
+      baseManifests.push({ base: bases[idx], manifest: r.value.data });
+    }
+  });
+  if (!baseManifests.length) {
+    console.error('No valid addon manifests fetched');
     process.exit(1);
   }
+  console.log(`Loaded ${baseManifests.length} addon manifests`);
+}
+
+// Initialize manifests, then start server
+initBaseManifests().then(() => console.log('Base manifests ready')); 
+
+// Build wrapper manifest
+function buildWrapperManifest() {
+  const manifests = baseManifests.map(bm => bm.manifest);
   return {
     id: 'stremio-proxy-wrapper',
     version: '1.0.0',
     name: 'Stremio Proxy Wrapper',
     description: 'Proxy svih vaših Stremio addon-a',
-    resources: ['catalog', 'meta', 'stream', 'subtitles'],
+    resources: ['catalog','meta','stream','subtitles'],
     types: [...new Set(manifests.flatMap(m => m.types || []))],
     idPrefixes: [...new Set(manifests.flatMap(m => m.idPrefixes || []))],
     catalogs: manifests.flatMap(m => m.catalogs || []),
@@ -76,15 +70,11 @@ async function buildWrapperManifest() {
     icon: manifests[0].icon || ''
   };
 }
-
 let wrapperManifest;
-buildWrapperManifest().then(m => {
-  wrapperManifest = m;
-  console.log(`Wrapper manifest built with ${m.catalogs.length} catalog entries`);
-}).catch(e => {
-  console.error('Error building manifest:', e.message);
-  process.exit(1);
-});
+setTimeout(() => {
+  wrapperManifest = buildWrapperManifest();
+  console.log(`Wrapper manifest built with ${wrapperManifest.catalogs.length} catalogs`);
+}, 1000);
 
 // Serve manifest
 app.get('/manifest.json', (req, res) => {
@@ -92,44 +82,106 @@ app.get('/manifest.json', (req, res) => {
   res.json(wrapperManifest);
 });
 
-// V4 endpoints
+// Catalog: only query bases that support this catalog ID
 app.post('/catalog', async (req, res) => {
-  const responses = await broadcastPost('catalog', req.body);
-  const metas = responses.reduce((acc, r) => (r && Array.isArray(r.metas) ? acc.concat(r.metas) : acc), []);
+  const catalogId = req.body.id;
+  const targets = baseManifests
+    .filter(bm => bm.manifest.catalogs.some(c => c.id === catalogId))
+    .map(bm => bm.base);
+  if (!targets.length) return res.json({ metas: [] });
+
+  const responses = await Promise.all(
+    targets.map(b =>
+      axios.post(`${b}/catalog`, req.body, { headers: {'Content-Type':'application/json'} })
+        .then(r => r.data)
+        .catch(() => null)
+    )
+  );
+  const metas = responses.reduce(
+    (acc, r) => (r && Array.isArray(r.metas) ? acc.concat(r.metas) : acc),
+    []
+  );
   res.json({ metas });
 });
+
+// Meta
 app.post('/meta', async (req, res) => {
-  const responses = await broadcastPost('meta', req.body);
+  const responses = await Promise.all(
+    baseManifests.map(bm =>
+      axios.post(`${bm.base}/meta`, req.body, { headers: {'Content-Type':'application/json'} })
+        .then(r => r.data)
+        .catch(() => null)
+    )
+  );
   const metas = [];
   responses.forEach(r => {
-    if (r && r.meta) metas.push(r.meta);
-    if (r && Array.isArray(r.metas)) metas.push(...r.metas);
+    if (r?.meta) metas.push(r.meta);
+    if (Array.isArray(r?.metas)) metas.push(...r.metas);
   });
   res.json({ metas });
 });
+
+// Stream
 app.post('/stream', async (req, res) => {
-  const responses = await broadcastPost('stream', req.body);
-  const streams = responses.reduce((acc, r) => (r && Array.isArray(r.streams) ? acc.concat(r.streams) : acc), []);
+  const responses = await Promise.all(
+    baseManifests.map(bm =>
+      axios.post(`${bm.base}/stream`, req.body, { headers: {'Content-Type':'application/json'} })
+        .then(r => r.data)
+        .catch(() => null)
+    )
+  );
+  const streams = responses.reduce(
+    (acc, r) => (r && Array.isArray(r.streams) ? acc.concat(r.streams) : acc),
+    []
+  );
   res.json({ streams });
 });
+
+// Subtitles
 app.post('/subtitles', async (req, res) => {
-  const responses = await broadcastPost('subtitles', req.body);
-  const subs = responses.reduce((acc, r) => (r && Array.isArray(r.subtitles) ? acc.concat(r.subtitles) : acc), []);
-  res.json({ subtitles: subs });
+  const responses = await Promise.all(
+    baseManifests.map(bm =>
+      axios.post(`${bm.base}/subtitles`, req.body, { headers: {'Content-Type':'application/json'} })
+        .then(r => r.data)
+        .catch(() => null)
+    )
+  );
+  const subtitles = responses.reduce(
+    (acc, r) => (r && Array.isArray(r.subtitles) ? acc.concat(r.subtitles) : acc),
+    []
+  );
+  res.json({ subtitles });
 });
 
-// Catch-all GET proxy for V3 compatibility
+// GET fallback for V3 compatibility
 app.get('*', async (req, res) => {
-  const urlPath = req.path;
+  const path = req.path.slice(1); // remove leading slash
   let key;
-  if (urlPath.startsWith('/catalog/')) key = 'metas';
-  else if (urlPath.startsWith('/stream/')) key = 'streams';
-  else if (urlPath.startsWith('/subtitles/')) key = 'subtitles';
+  if (path.startsWith('catalog/')) key = 'metas';
+  else if (path.startsWith('stream/')) key = 'streams';
+  else if (path.startsWith('subtitles/')) key = 'subtitles';
   else return res.status(404).json({ error: 'Not found' });
 
-  const path = urlPath.slice(1); // remove leading slash
-  const responses = await broadcastGet(path);
-  const combined = responses.reduce((acc, r) => (r && Array.isArray(r[key]) ? acc.concat(r[key]) : acc), []);
+  // extract catalog id for GET and filter bases
+  let targets = bases;
+  if (key === 'metas') {
+    const parts = path.split('/'); // ['catalog','movie','id.json']
+    const id = parts[2]?.replace('.json','');
+    targets = baseManifests
+      .filter(bm => bm.manifest.catalogs.some(c => c.id === id))
+      .map(bm => bm.base);
+  }
+  const responses = await Promise.all(
+    targets.map(b =>
+      axios.get(`${b}/${path}`)
+        .then(r => r.data)
+        .catch(() => null)
+    )
+  );
+  const combined = responses.reduce(
+    (acc, r) => (r && Array.isArray(r[key]) ? acc.concat(r[key]) : acc),
+    []
+  );
   res.json({ [key]: combined });
 });
 
