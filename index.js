@@ -23,53 +23,65 @@ try {
   process.exit(1);
 }
 if (process.env.TARGET_ADDON_BASES) rawBases = process.env.TARGET_ADDON_BASES.split(',');
-const bases = rawBases.map(u => u.trim().replace(/\/manifest\.json$/i, '').replace(/\/+$/, '')).filter(Boolean);
+const bases = rawBases
+  .map(u => u.trim().replace(/\/manifest\.json$/i, '').replace(/\/+$/, ''))
+  .filter(Boolean);
 if (!bases.length) {
   console.error('No valid TARGET_ADDON_BASES provided');
   process.exit(1);
 }
 
 // Load allowed API tokens from environment
-const ALLOWED_TOKENS = (process.env.ACCESS_TOKENS || '').split(',').map(t => t.trim()).filter(Boolean);
+const ALLOWED_TOKENS = (process.env.ACCESS_TOKENS || '')
+  .split(',')
+  .map(t => t.trim())
+  .filter(Boolean);
 if (!ALLOWED_TOKENS.length) {
   console.error('ACCESS_TOKENS not set or empty');
   process.exit(1);
 }
 
-// Middleware: allow manifest and configure endpoints without token
+// Middleware: require token for all endpoints except manifest
 app.use((req, res, next) => {
-  if (req.path === '/manifest.json' || req.path === '/configure') {
-    return next();
-  }
-  // Token can be sent in POST body under config or as query parameter
-  let token = req.body?.config?.token;
-  if (!token) token = req.query.token;
+  if (req.path === '/manifest.json') return next();
+  // Token can be sent in POST body under req.body.config.token or as query parameter
+  let token = req.body?.config?.token || req.query.token;
   if (!token || !ALLOWED_TOKENS.includes(token)) {
     return res.status(401).json({ error: 'Unauthorized: invalid or missing token' });
   }
   next();
 });
 
-// Broadcast GET helper
+// Helper functions for proxying
 async function broadcastGet(path) {
-  const calls = bases.map(b =>
-    axios.get(`${b}/${path}`).then(r => r.data).catch(() => null)
+  return Promise.all(
+    bases.map(b =>
+      axios.get(`${b}/${path}`).then(r => r.data).catch(() => null)
+    )
   );
-  return Promise.all(calls);
 }
-
-// Broadcast POST helper
 async function broadcastPost(path, body) {
-  const calls = bases.map(b =>
-    axios.post(`${b}/${path}`, body, { headers: { 'Content-Type': 'application/json' } }).then(r => r.data).catch(() => null)
+  return Promise.all(
+    bases.map(b =>
+      axios.post(`${b}/${path}`, body, { headers: { 'Content-Type': 'application/json' } })
+        .then(r => r.data)
+        .catch(() => null)
+    )
   );
-  return Promise.all(calls);
 }
 
 // Build wrapper manifest
 async function buildWrapperManifest() {
-  const results = await Promise.allSettled(bases.map(b => axios.get(`${b}/manifest.json`)));
-  const manifests = results.map(r => r.status === 'fulfilled' ? r.value.data : null).filter(Boolean);
+  const results = await Promise.allSettled(
+    bases.map(b => axios.get(`${b}/manifest.json`))
+  );
+  const manifests = results
+    .map(r => (r.status === 'fulfilled' ? r.value.data : null))
+    .filter(Boolean);
+  if (!manifests.length) {
+    console.error('No valid manifests fetched');
+    process.exit(1);
+  }
   return {
     id: 'stremio-proxy-wrapper',
     version: '1.0.0',
@@ -87,28 +99,29 @@ async function buildWrapperManifest() {
 }
 
 let wrapperManifest;
-buildWrapperManifest().then(man => {
-  wrapperManifest = man;
-  console.log(`Wrapper manifest built with ${man.catalogs.length} catalog entries`);
-}).catch(err => {
-  console.error('Error:', err.message);
-  process.exit(1);
-});
+buildWrapperManifest()
+  .then(man => {
+    wrapperManifest = man;
+    console.log(`Wrapper manifest built with ${man.catalogs.length} catalog entries`);
+  })
+  .catch(err => {
+    console.error('Error building manifest:', err.message);
+    process.exit(1);
+  });
 
-// Serve manifest and configure endpoints
+// Serve manifest
 app.get('/manifest.json', (req, res) => {
   if (!wrapperManifest) return res.status(503).json({ error: 'Manifest not ready' });
   res.json(wrapperManifest);
-});
-app.get('/configure', (req, res) => {
-  if (!wrapperManifest) return res.status(503).json({ error: 'Manifest not ready' });
-  res.json(wrapperManifest.config);
 });
 
 // V4 endpoints
 app.post('/catalog', async (req, res) => {
   const responses = await broadcastPost('catalog', req.body);
-  const metas = responses.reduce((a, r) => (r && Array.isArray(r.metas) ? a.concat(r.metas) : a), []);
+  const metas = responses.reduce(
+    (a, r) => (r && Array.isArray(r.metas) ? a.concat(r.metas) : a),
+    []
+  );
   res.json({ metas });
 });
 app.post('/meta', async (req, res) => {
@@ -122,16 +135,22 @@ app.post('/meta', async (req, res) => {
 });
 app.post('/stream', async (req, res) => {
   const responses = await broadcastPost('stream', req.body);
-  const streams = responses.reduce((a, r) => (r && Array.isArray(r.streams) ? a.concat(r.streams) : a), []);
+  const streams = responses.reduce(
+    (a, r) => (r && Array.isArray(r.streams) ? a.concat(r.streams) : a),
+    []
+  );
   res.json({ streams });
 });
 app.post('/subtitles', async (req, res) => {
   const responses = await broadcastPost('subtitles', req.body);
-  const subs = responses.reduce((a, r) => (r && Array.isArray(r.subtitles) ? a.concat(r.subtitles) : a), []);
-  res.json({ subtitles: subs });
+  const subtitles = responses.reduce(
+    (a, r) => (r && Array.isArray(r.subtitles) ? a.concat(r.subtitles) : a),
+    []
+  );
+  res.json({ subtitles });
 });
 
-// Catch-all GET proxy
+// Catch-all GET proxy for V3
 app.get('*', async (req, res) => {
   const path = req.path.slice(1);
   let key;
@@ -139,8 +158,12 @@ app.get('*', async (req, res) => {
   else if (path.startsWith('stream/')) key = 'streams';
   else if (path.startsWith('subtitles/')) key = 'subtitles';
   else return res.status(404).json({ error: 'Not found' });
+
   const responses = await broadcastGet(path);
-  const combined = responses.reduce((a, r) => (r && Array.isArray(r[key]) ? a.concat(r[key]) : a), []);
+  const combined = responses.reduce(
+    (a, r) => (r && Array.isArray(r[key]) ? a.concat(r[key]) : a),
+    []
+  );
   res.json({ [key]: combined });
 });
 
