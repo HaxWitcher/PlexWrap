@@ -1,10 +1,6 @@
 const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
-const path = require('path');
-
-// Ensure working directory is the folder containing this script
-process.chdir(path.dirname(__filename));
 
 const app = express();
 
@@ -18,149 +14,175 @@ app.use((req, res, next) => {
 });
 app.use(express.json());
 
-// Directory containing multiple config files named {configName}.json
-const CONFIG_DIR = path.join(__dirname, 'configs');
-const configs = {};          // configName -> { bases, baseManifests }
-const wrapperManifests = {}; // configName -> wrapper manifest JSON
-
-// Discover available config names (files without .json)
-let configNames;
+// Load target addon bases from config.json or env var
+let rawBases;
 try {
-  configNames = fs.readdirSync(CONFIG_DIR)
-    .filter(f => f.endsWith('.json'))
-    .map(f => f.replace(/\.json$/, ''));
-} catch (err) {
-  console.error(`Failed to read configs directory: ${err.message}`);
+  rawBases = JSON.parse(fs.readFileSync('./config.json')).TARGET_ADDON_BASES;
+} catch (e) {
+  console.error('Cannot load config.json:', e.message);
+  process.exit(1);
+}
+if (process.env.TARGET_ADDON_BASES) {
+  rawBases = process.env.TARGET_ADDON_BASES.split(',');
+}
+const bases = rawBases
+  .map(u => u.trim().replace(/\/manifest\.json$/i, '').replace(/\/+$/, ''))
+  .filter(Boolean);
+if (!bases.length) {
+  console.error('No valid TARGET_ADDON_BASES provided');
   process.exit(1);
 }
 
-// Initialize a config: load bases, fetch manifests, build wrapper
-async function initConfig(configName) {
-  const cfgFile = path.join(CONFIG_DIR, `${configName}.json`);
-  let cfg;
-  try {
-    cfg = JSON.parse(fs.readFileSync(cfgFile));
-  } catch (e) {
-    console.error(`Error parsing ${cfgFile}: ${e.message}`);
-    return;
-  }
-
-  const bases = (cfg.TARGET_ADDON_BASES || [])
-    .map(u => u.trim().replace(/\/+$/, '').replace(/\/manifest\.json$/i, ''))
-    .filter(Boolean);
-
-  const baseManifests = [];
-  await Promise.all(
-    bases.map(async base => {
-      try {
-        const res = await axios.get(`${base}/manifest.json`);
-        if (res.data.catalogs) baseManifests.push({ base, manifest: res.data });
-      } catch {}
-    })
+// Fetch and store each base's manifest
+const baseManifests = [];
+async function initBaseManifests() {
+  const results = await Promise.allSettled(
+    bases.map(b => axios.get(`${b}/manifest.json`))
   );
+  results.forEach((r, idx) => {
+    if (r.status === 'fulfilled' && r.value.data.catalogs) {
+      baseManifests.push({ base: bases[idx], manifest: r.value.data });
+    }
+  });
+  if (!baseManifests.length) {
+    console.error('No valid addon manifests fetched');
+    process.exit(1);
+  }
+  console.log(`Loaded ${baseManifests.length} addon manifests`);
+}
 
-  configs[configName] = { bases, baseManifests };
+// Initialize manifests
+initBaseManifests().then(() => console.log('Base manifests ready'));
 
-  // Build wrapper manifest
+// Build wrapper manifest
+function buildWrapperManifest() {
   const manifests = baseManifests.map(bm => bm.manifest);
-  wrapperManifests[configName] = {
-    id: `stremio-proxy-wrapper-${configName}`,
+  return {
+    id: 'stremio-proxy-wrapper',
     version: '1.0.0',
-    name: `Stremio Proxy Wrapper (${configName})`, // differentiate
+    name: 'Stremio Proxy Wrapper',
     description: 'Proxy svih vaših Stremio addon-a',
-    resources: ['catalog', 'meta', 'stream', 'subtitles'],
+    resources: ['catalog','meta','stream','subtitles'],
     types: [...new Set(manifests.flatMap(m => m.types || []))],
     idPrefixes: [...new Set(manifests.flatMap(m => m.idPrefixes || []))],
     catalogs: manifests.flatMap(m => m.catalogs || []),
-    logo: manifests[0]?.logo || '',
-    icon: manifests[0]?.icon || ''
+    logo: manifests[0].logo || '',
+    icon: manifests[0].icon || ''
   };
-
-  console.log(`Initialized config ${configName}: ${manifests.length} base addons`);
 }
+let wrapperManifest;
+setTimeout(() => {
+  wrapperManifest = buildWrapperManifest();
+  console.log(`Wrapper manifest built with ${wrapperManifest.catalogs.length} catalogs`);
+}, 1000);
 
-// Load all configs
-Promise.all(configNames.map(initConfig))
-  .then(() => console.log(`All configs ready: ${configNames.join(', ')}`))
-  .catch(err => {
-    console.error('Error initializing configs:', err);
-    process.exit(1);
-  });
-
-// Serve wrapper manifest per config
-app.get('/:config/manifest.json', (req, res) => {
-  const manifest = wrapperManifests[req.params.config];
-  if (!manifest) return res.status(404).json({ error: 'Config not found' });
-  res.json(manifest);
+// Serve manifest
+app.get('/manifest.json', (req, res) => {
+  if (!wrapperManifest) return res.status(503).json({ error: 'Manifest not ready' });
+  res.json(wrapperManifest);
 });
 
-// Generic V4 POST handler converting to V3 GET
-async function handleV4(req, res, listKey, v3path) {
-  const configName = req.params.config;
-  const cfg = configs[configName];
-  if (!cfg) return res.json({ [listKey]: [] });
+// Catalog
+app.post('/catalog', async (req, res) => {
+  const catalogId = req.body.id;
+  const targets = baseManifests
+    .filter(bm => bm.manifest.catalogs.some(c => c.id === catalogId))
+    .map(bm => bm.base);
+  if (!targets.length) return res.json({ metas: [] });
 
-  // Determine targets
-  let targets = cfg.baseManifests;
-  if (listKey === 'metas') {
-    const id = req.body.id;
-    targets = targets.filter(bm => bm.manifest.catalogs.some(c => c.id === id));
-  }
-
-  // For 'catalog' or 'subtitles', support extra params
-  const qs = req.body.extra
-    ? '?' + req.body.extra.map(e => `${encodeURIComponent(e.name)}=${encodeURIComponent(e.value)}`).join('&')
-    : '';
-
-  const items = [];
-  await Promise.all(
-    targets.map(async bm => {
-      try {
-        const url = `${bm.base}/${v3path}/${req.body.type}/${
-          listKey === 'metas' ? req.body.id : req.body.id
-        }.json${qs}`;
-        const r = await axios.get(url);
-        if (Array.isArray(r.data[listKey])) items.push(...r.data[listKey]);
-      } catch {}
-    })
+  const responses = await Promise.all(
+    targets.map(b =>
+      axios.post(`${b}/catalog`, req.body, { headers: {'Content-Type':'application/json'} })
+        .then(r => r.data)
+        .catch(() => null)
+    )
   );
+  const metas = responses.reduce(
+    (acc, r) => (r && Array.isArray(r.metas) ? acc.concat(r.metas) : acc),
+    []
+  );
+  res.json({ metas });
+});
 
-  res.json({ [listKey]: items });
-}
+// Meta
+app.post('/meta', async (req, res) => {
+  const responses = await Promise.all(
+    baseManifests.map(bm =>
+      axios.post(`${bm.base}/meta`, req.body, { headers: {'Content-Type':'application/json'} })
+        .then(r => r.data)
+        .catch(() => null)
+    )
+  );
+  const metas = [];
+  responses.forEach(r => {
+    if (r?.meta) metas.push(r.meta);
+    if (Array.isArray(r?.metas)) metas.push(...r.metas);
+  });
+  res.json({ metas });
+});
 
-app.post('/:config/catalog', (req, res) => handleV4(req, res, 'metas', 'catalog'));
-app.post('/:config/stream', (req, res) => handleV4(req, res, 'streams', 'stream'));
-app.post('/:config/subtitles', (req, res) => handleV4(req, res, 'subtitles', 'subtitles'));
-app.post('/:config/meta', (req, res) => handleV4(req, res, 'metas', 'meta'));
+// Stream
+app.post('/stream', async (req, res) => {
+  const responses = await Promise.all(
+    baseManifests.map(bm =>
+      axios.post(`${bm.base}/stream`, req.body, { headers: {'Content-Type':'application/json'} })
+        .then(r => r.data)
+        .catch(() => null)
+    )
+  );
+  const streams = responses.reduce(
+    (acc, r) => (r && Array.isArray(r.streams) ? acc.concat(r.streams) : acc),
+    []
+  );
+  res.json({ streams });
+});
 
-// Fallback GET for V3 routes
-app.get('/:config/:path(*)', async (req, res) => {
-  const configName = req.params.config;
-  const cfg = configs[configName];
-  if (!cfg) return res.status(404).json({ error: 'Config not found' });
+// Subtitles
+app.post('/subtitles', async (req, res) => {
+  const responses = await Promise.all(
+    baseManifests.map(bm =>
+      axios.post(`${bm.base}/subtitles`, req.body, { headers: {'Content-Type':'application/json'} })
+        .then(r => r.data)
+        .catch(() => null)
+    )
+  );
+  const subtitles = responses.reduce(
+    (acc, r) => (r && Array.isArray(r.subtitles) ? acc.concat(r.subtitles) : acc),
+    []
+  );
+  res.json({ subtitles });
+});
 
-  const p = req.params.path;
-  let listKey;
-  if (p.startsWith('catalog/')) listKey = 'metas';
-  else if (p.startsWith('stream/')) listKey = 'streams';
-  else if (p.startsWith('subtitles/')) listKey = 'subtitles';
+// GET fallback for V3
+app.get('*', async (req, res) => {
+  const path = req.path.slice(1);
+  let key;
+  if (path.startsWith('catalog/')) key = 'metas';
+  else if (path.startsWith('stream/')) key = 'streams';
+  else if (path.startsWith('subtitles/')) key = 'subtitles';
   else return res.status(404).json({ error: 'Not found' });
 
-  const parts = p.split('/');
-  const id = listKey === 'metas' ? parts[2].replace('.json', '') : null;
+  let targets = bases;
+  if (key === 'metas') {
+    const parts = path.split('/');
+    const id = parts[2]?.replace('.json','');
+    targets = baseManifests
+      .filter(bm => bm.manifest.catalogs.some(c => c.id === id))
+      .map(bm => bm.base);
+  }
 
-  const items = [];
-  await Promise.all(
-    cfg.baseManifests.map(async bm => {
-      if (listKey === 'metas' && !bm.manifest.catalogs.some(c => c.id === id)) return;
-      try {
-        const r = await axios.get(`${bm.base}/${p}`, { headers: req.headers });
-        if (Array.isArray(r.data[listKey])) items.push(...r.data[listKey]);
-      } catch {}
-    })
+  const responses = await Promise.all(
+    targets.map(b =>
+      axios.get(`${b}/${path}`)
+        .then(r => r.data)
+        .catch(() => null)
+    )
   );
-
-  res.json({ [listKey]: items });
+  const combined = responses.reduce(
+    (acc, r) => (r && Array.isArray(r[key]) ? acc.concat(r[key]) : acc),
+    []
+  );
+  res.json({ [key]: combined });
 });
 
 // Start server
