@@ -4,12 +4,12 @@ const axios   = require('axios');
 const fs      = require('fs');
 const path    = require('path');
 
-// make sure we run from this folder
+// Osiguraj da radimo iz direktorijuma gde je ovaj fajl
 process.chdir(path.dirname(__filename));
 
 const app = express();
 
-// CORS + JSON body parsing
+// CORS i parsiranje JSON tela
 app.use((req, res, next) => {
   res.set('Access-Control-Allow-Origin',  '*');
   res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
@@ -19,16 +19,16 @@ app.use((req, res, next) => {
 });
 app.use(express.json());
 
-// --- Load configs ------------------------------------------------------------
+// --- Učitavanje config fajlova ----------------------------------------------
 const CONFIG_DIR  = path.join(__dirname, 'configs');
 const configFiles = fs.existsSync(CONFIG_DIR)
   ? fs.readdirSync(CONFIG_DIR).filter(f => f.endsWith('.json'))
   : [];
 const configNames = configFiles.map(f => f.replace(/\.json$/, ''));
 
-// holds raw baseManifests per config
-const configs          = {}; // configs[configName] = [ { base, manifest }, … ]
-const wrapperManifests = {}; // wrapperManifests[configName] = merged manifest
+// Ovde čuvamo po-config listu baza i generisane manifest-e
+const configs          = {}; // configs[ime] = [ { base, manifest }, ... ]
+const wrapperManifests = {}; // wrapperManifests[ime] = spojen manifest
 
 async function initConfig(name) {
   const file = path.join(CONFIG_DIR, name + '.json');
@@ -36,11 +36,11 @@ async function initConfig(name) {
   try {
     cfg = JSON.parse(fs.readFileSync(file));
   } catch (e) {
-    console.error(`❌ Failed to load ${file}:`, e.message);
+    console.error(`❌ Ne mogu da učitam ${file}:`, e.message);
     return;
   }
 
-  // clean and dedupe
+  // Normalizuj i ukloni duplikate iz TARGET_ADDON_BASES
   const bases = Array.from(new Set(
     (cfg.TARGET_ADDON_BASES || [])
       .map(u => u.trim()
@@ -49,7 +49,7 @@ async function initConfig(name) {
       .filter(Boolean)
   ));
 
-  // fetch each manifest
+  // Fetch-uj svaki manifest
   const results = await Promise.allSettled(
     bases.map(b => axios.get(`${b}/manifest.json`))
   );
@@ -59,17 +59,17 @@ async function initConfig(name) {
     if (r.status === 'fulfilled' && r.value.data) {
       baseManifests.push({ base: bases[i], manifest: r.value.data });
     } else {
-      console.warn(`⚠️  [${name}] manifest fetch failed for ${bases[i]}`);
+      console.warn(`⚠️  [${name}] fetch manifest-a za ${bases[i]} nije uspeo`);
     }
   });
 
   configs[name] = baseManifests;
   if (!baseManifests.length) {
-    console.error(`❌ [${name}] no valid addon manifests`);
+    console.error(`❌ [${name}] nema važećih manifest-a`);
     return;
   }
 
-  // build wrapper manifest
+  // Pravi "wrapper" manifest za ovaj config
   const manifests = baseManifests.map(bm => bm.manifest);
   const wrapper = {
     manifestVersion: '4',
@@ -86,29 +86,29 @@ async function initConfig(name) {
   };
 
   wrapperManifests[name] = wrapper;
-  console.log(`✅ [${name}] initialized: ${baseManifests.length} bases, ${wrapper.catalogs.length} catalogs`);
+  console.log(`✅ [${name}] inicijalizovano: ${baseManifests.length} baza, ${wrapper.catalogs.length} kataloga`);
 }
 
-// init all
+// Inicijalizuj sve configuracije
 Promise.all(configNames.map(initConfig))
-  .then(() => console.log(`🎉 All configs ready: ${configNames.join(', ')}`))
-  .catch(err => console.error('❌ init error:', err));
+  .then(() => console.log(`🎉 Svi config-i spremni: ${configNames.join(', ')}`))
+  .catch(err => console.error('❌ Greška pri inicijalizaciji:', err));
 
-// --- Manifest route ---------------------------------------------------------
+// --- Ruta za manifest -------------------------------------------------------
 app.get('/:config/manifest.json', (req, res) => {
   const w = wrapperManifests[req.params.config];
-  if (!w) return res.status(404).json({ error: 'Config not found' });
+  if (!w) return res.status(404).json({ error: 'Config nije pronađen' });
   res.json(w);
 });
 
-// --- POST handlers ----------------------------------------------------------
+// --- POST handleri za katalog, meta, stream i subtitles ---------------------
 function makeHandler(key, endpoint) {
   return async (req, res) => {
     const name = req.params.config;
     const bases = configs[name] || [];
     if (!bases.length) return res.json({ [key]: [] });
 
-    // for catalogs, filter by ID
+    // za katalog filtriraj po id-u kataloga
     let targets = bases;
     if (key === 'metas') {
       const id = req.body.id;
@@ -125,10 +125,12 @@ function makeHandler(key, endpoint) {
       )
     );
 
-    // combine
+    // spoji rezultate
     const combined = [];
     results.forEach(r => {
-      if (r.status === 'fulfilled' && r.value.data && Array.isArray(r.value.data[key])) {
+      if (r.status === 'fulfilled' &&
+          r.value.data &&
+          Array.isArray(r.value.data[key])) {
         combined.push(...r.value.data[key]);
       }
     });
@@ -136,25 +138,25 @@ function makeHandler(key, endpoint) {
   };
 }
 
-app.post('/:config/catalog',    makeHandler('metas',     'catalog'));
-app.post('/:config/meta',       makeHandler('metas',     'meta'));
-app.post('/:config/stream',     makeHandler('streams',   'stream'));
-app.post('/:config/subtitles',  makeHandler('subtitles', 'subtitles'));
+app.post('/:config/catalog',   makeHandler('metas',     'catalog'));
+app.post('/:config/meta',      makeHandler('metas',     'meta'));
+app.post('/:config/stream',    makeHandler('streams',   'stream'));
+app.post('/:config/subtitles', makeHandler('subtitles', 'subtitles'));
 
-// --- GET fallback for v3 compatibility -------------------------------------
+// --- GET fallback za v3 kompatibilnost -------------------------------------
 app.get('/:config/:path(*)', async (req, res) => {
   const name = req.params.config;
   const bases = configs[name] || [];
-  if (!bases.length) return res.status(404).json({ error: 'Config not found' });
+  if (!bases.length) return res.status(404).json({ error: 'Config nije pronađen' });
 
   const route = req.params.path;
   let key;
-  if (route.startsWith('catalog/'))    key = 'metas';
-  else if (route.startsWith('stream/')) key = 'streams';
+  if (route.startsWith('catalog/'))     key = 'metas';
+  else if (route.startsWith('stream/'))  key = 'streams';
   else if (route.startsWith('subtitles/')) key = 'subtitles';
-  else return res.status(404).json({ error: 'Not found' });
+  else return res.status(404).json({ error: 'Nije pronađeno' });
 
-  // filter catalog GET by ID
+  // za katalog GET filtriraj po id-u
   let targets = bases;
   if (key === 'metas') {
     const parts = route.split('/');
@@ -169,13 +171,15 @@ app.get('/:config/:path(*)', async (req, res) => {
   );
   const combined = [];
   results.forEach(r => {
-    if (r.status === 'fulfilled' && r.value.data && Array.isArray(r.value.data[key])) {
+    if (r.status === 'fulfilled' &&
+        r.value.data &&
+        Array.isArray(r.value.data[key])) {
       combined.push(...r.value.data[key]);
     }
   });
   res.json({ [key]: combined });
 });
 
-// --- Start server -----------------------------------------------------------
+// --- Startovanje servera ---------------------------------------------------
 const PORT = process.env.PORT || 7000;
-app.listen(PORT, () => console.log(`🔌 Listening on :${PORT}`));
+app.listen(PORT, () => console.log(`🔌 Slušam na portu :${PORT}`));
