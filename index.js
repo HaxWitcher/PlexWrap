@@ -3,6 +3,9 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 
+// Ensure working directory is always the folder containing this script
+process.chdir(path.dirname(__filename));
+
 const app = express();
 
 // Enable CORS for Stremio
@@ -17,7 +20,7 @@ app.use(express.json());
 
 // Directory containing multiple config files named {configName}.json
 const CONFIG_DIR = path.join(__dirname, 'configs');
-// Maps and arrays to store per-config data
+// Stores loaded configs and manifests
 const configs = {};          // configName -> { bases, baseManifests }
 const wrapperManifests = {}; // configName -> wrapper manifest JSON
 
@@ -26,7 +29,7 @@ const configNames = fs.readdirSync(CONFIG_DIR)
   .filter(f => f.endsWith('.json'))
   .map(f => f.replace(/\.json$/, ''));
 
-// Initialize a single config: load bases, fetch each addon manifest, build wrapper
+// Load and initialize one config
 async function initConfig(configName) {
   const cfg = JSON.parse(fs.readFileSync(path.join(CONFIG_DIR, `${configName}.json`)));
   let rawBases = cfg.TARGET_ADDON_BASES || [];
