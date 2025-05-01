@@ -1,6 +1,8 @@
 const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
+const path = require('path');
+
 const app = express();
 
 // Enable CORS for Stremio
@@ -11,31 +13,29 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
-
 app.use(express.json());
 
-// Load target addon bases
-let rawBases;
-try {
-  rawBases = JSON.parse(fs.readFileSync('./config.json')).TARGET_ADDON_BASES;
-} catch (e) {
-  console.error('Cannot load config.json:', e.message);
-  process.exit(1);
-}
-if (process.env.TARGET_ADDON_BASES) {
-  rawBases = process.env.TARGET_ADDON_BASES.split(',');
-}
-const bases = rawBases
-  .map(u => u.trim().replace(/\/manifest\.json$/i, '').replace(/\/+$/, ''))
-  .filter(Boolean);
-if (!bases.length) {
-  console.error('No valid TARGET_ADDON_BASES provided');
-  process.exit(1);
-}
+// Directory containing multiple config files named {configName}.json
+const CONFIG_DIR = path.join(__dirname, 'configs');
+// Maps and arrays to store per-config data
+const configs = {};          // configName -> { bases, baseManifests }
+const wrapperManifests = {}; // configName -> wrapper manifest JSON
 
-// Fetch and store each base's manifest
-const baseManifests = [];
-async function initBaseManifests() {
+// Discover available config names (file names without .json)
+const configNames = fs.readdirSync(CONFIG_DIR)
+  .filter(f => f.endsWith('.json'))
+  .map(f => f.replace(/\.json$/, ''));
+
+// Initialize a single config: load bases, fetch each addon manifest, build wrapper
+async function initConfig(configName) {
+  const cfg = JSON.parse(fs.readFileSync(path.join(CONFIG_DIR, `${configName}.json`)));
+  let rawBases = cfg.TARGET_ADDON_BASES || [];
+  const bases = rawBases
+    .map(u => u.trim().replace(/\/+$/,'').replace(/\/manifest\.json$/i,''))
+    .filter(Boolean);
+
+  // Fetch each base's manifest
+  const baseManifests = [];
   const results = await Promise.allSettled(
     bases.map(b => axios.get(`${b}/manifest.json`))
   );
@@ -44,144 +44,111 @@ async function initBaseManifests() {
       baseManifests.push({ base: bases[idx], manifest: r.value.data });
     }
   });
-  if (!baseManifests.length) {
-    console.error('No valid addon manifests fetched');
-    process.exit(1);
-  }
-  console.log(`Loaded ${baseManifests.length} addon manifests`);
-}
+  if (!baseManifests.length) console.error(`! No valid manifests for config: ${configName}`);
+  configs[configName] = { bases, baseManifests };
 
-// Initialize manifests, then start server
-initBaseManifests().then(() => console.log('Base manifests ready')); 
-
-// Build wrapper manifest
-function buildWrapperManifest() {
+  // Build wrapper manifest for this config
   const manifests = baseManifests.map(bm => bm.manifest);
-  return {
-    id: 'stremio-proxy-wrapper',
+  const wrapper = {
+    id: `stremio-proxy-wrapper-${configName}`,
     version: '1.0.0',
-    name: 'Stremio Proxy Wrapper',
+    name: `Stremio Proxy Wrapper (${configName})`, // differentiate name
     description: 'Proxy svih vaših Stremio addon-a',
     resources: ['catalog','meta','stream','subtitles'],
     types: [...new Set(manifests.flatMap(m => m.types || []))],
     idPrefixes: [...new Set(manifests.flatMap(m => m.idPrefixes || []))],
     catalogs: manifests.flatMap(m => m.catalogs || []),
-    logo: manifests[0].logo || '',
-    icon: manifests[0].icon || ''
+    logo: manifests[0]?.logo || '',
+    icon: manifests[0]?.icon || ''
+  };
+  wrapperManifests[configName] = wrapper;
+  console.log(`Initialized config ${configName}: ${wrapper.catalogs.length} catalogs`);
+}
+
+// Initialize all configs
+Promise.all(configNames.map(initConfig))
+  .then(() => console.log(`All configs ready: ${configNames.join(', ')}`))
+  .catch(err => {
+    console.error('Error initializing configs:', err);
+    process.exit(1);
+  });
+
+// Serve manifest per config
+app.get('/:config/manifest.json', (req, res) => {
+  const conf = req.params.config;
+  const manifest = wrapperManifests[conf];
+  if (!manifest) return res.status(404).json({ error: 'Config not found' });
+  res.json(manifest);
+});
+
+// Generic handler factory for POST endpoints
+function makePostHandler(key) {
+  return async (req, res) => {
+    const conf = req.params.config;
+    const cfg = configs[conf];
+    if (!cfg) return res.json({ [key]: [] });
+
+    let targets = cfg.baseManifests;
+    // For catalog, filter by requested catalog id
+    if (key === 'metas') {
+      const catalogId = req.body.id;
+      targets = cfg.baseManifests.filter(bm => bm.manifest.catalogs.some(c => c.id === catalogId));
+    }
+    if (!targets.length) return res.json({ [key]: [] });
+
+    // Proxy all requests
+    const responses = await Promise.all(
+      targets.map(bm =>
+        axios.post(`${bm.base}/${key === 'metas' ? 'catalog' : key}`, req.body, { headers: {'Content-Type':'application/json'} })
+          .then(r => r.data)
+          .catch(() => null)
+      )
+    );
+
+    // Combine arrays
+    const combined = responses.reduce((acc, r) => {
+      if (r && Array.isArray(r[key])) acc.push(...r[key]);
+      return acc;
+    }, []);
+    res.json({ [key]: combined });
   };
 }
-let wrapperManifest;
-setTimeout(() => {
-  wrapperManifest = buildWrapperManifest();
-  console.log(`Wrapper manifest built with ${wrapperManifest.catalogs.length} catalogs`);
-}, 1000);
+app.post('/:config/catalog', makePostHandler('metas'));
+app.post('/:config/meta', makePostHandler('metas'));
+app.post('/:config/stream', makePostHandler('streams'));
+app.post('/:config/subtitles', makePostHandler('subtitles'));
 
-// Serve manifest
-app.get('/manifest.json', (req, res) => {
-  if (!wrapperManifest) return res.status(503).json({ error: 'Manifest not ready' });
-  res.json(wrapperManifest);
-});
+// Fallback GET for V3 compatibility
+app.get('/:config/:path(*)', async (req, res) => {
+  const conf = req.params.config;
+  const cfg = configs[conf];
+  if (!cfg) return res.status(404).json({ error: 'Config not found' });
 
-// Catalog: only query bases that support this catalog ID
-app.post('/catalog', async (req, res) => {
-  const catalogId = req.body.id;
-  const targets = baseManifests
-    .filter(bm => bm.manifest.catalogs.some(c => c.id === catalogId))
-    .map(bm => bm.base);
-  if (!targets.length) return res.json({ metas: [] });
-
-  const responses = await Promise.all(
-    targets.map(b =>
-      axios.post(`${b}/catalog`, req.body, { headers: {'Content-Type':'application/json'} })
-        .then(r => r.data)
-        .catch(() => null)
-    )
-  );
-  const metas = responses.reduce(
-    (acc, r) => (r && Array.isArray(r.metas) ? acc.concat(r.metas) : acc),
-    []
-  );
-  res.json({ metas });
-});
-
-// Meta
-app.post('/meta', async (req, res) => {
-  const responses = await Promise.all(
-    baseManifests.map(bm =>
-      axios.post(`${bm.base}/meta`, req.body, { headers: {'Content-Type':'application/json'} })
-        .then(r => r.data)
-        .catch(() => null)
-    )
-  );
-  const metas = [];
-  responses.forEach(r => {
-    if (r?.meta) metas.push(r.meta);
-    if (Array.isArray(r?.metas)) metas.push(...r.metas);
-  });
-  res.json({ metas });
-});
-
-// Stream
-app.post('/stream', async (req, res) => {
-  const responses = await Promise.all(
-    baseManifests.map(bm =>
-      axios.post(`${bm.base}/stream`, req.body, { headers: {'Content-Type':'application/json'} })
-        .then(r => r.data)
-        .catch(() => null)
-    )
-  );
-  const streams = responses.reduce(
-    (acc, r) => (r && Array.isArray(r.streams) ? acc.concat(r.streams) : acc),
-    []
-  );
-  res.json({ streams });
-});
-
-// Subtitles
-app.post('/subtitles', async (req, res) => {
-  const responses = await Promise.all(
-    baseManifests.map(bm =>
-      axios.post(`${bm.base}/subtitles`, req.body, { headers: {'Content-Type':'application/json'} })
-        .then(r => r.data)
-        .catch(() => null)
-    )
-  );
-  const subtitles = responses.reduce(
-    (acc, r) => (r && Array.isArray(r.subtitles) ? acc.concat(r.subtitles) : acc),
-    []
-  );
-  res.json({ subtitles });
-});
-
-// GET fallback for V3 compatibility
-app.get('*', async (req, res) => {
-  const path = req.path.slice(1); // remove leading slash
+  const pathKey = req.params.path;
   let key;
-  if (path.startsWith('catalog/')) key = 'metas';
-  else if (path.startsWith('stream/')) key = 'streams';
-  else if (path.startsWith('subtitles/')) key = 'subtitles';
+  if (pathKey.startsWith('catalog/')) key = 'metas';
+  else if (pathKey.startsWith('stream/')) key = 'streams';
+  else if (pathKey.startsWith('subtitles/')) key = 'subtitles';
   else return res.status(404).json({ error: 'Not found' });
 
-  // extract catalog id for GET and filter bases
-  let targets = bases;
+  let targets = cfg.baseManifests;
   if (key === 'metas') {
-    const parts = path.split('/'); // ['catalog','movie','id.json']
+    const parts = pathKey.split('/');
     const id = parts[2]?.replace('.json','');
-    targets = baseManifests
-      .filter(bm => bm.manifest.catalogs.some(c => c.id === id))
-      .map(bm => bm.base);
+    targets = cfg.baseManifests.filter(bm => bm.manifest.catalogs.some(c => c.id === id));
   }
+
   const responses = await Promise.all(
-    targets.map(b =>
-      axios.get(`${b}/${path}`)
+    targets.map(bm =>
+      axios.get(`${bm.base}/${pathKey}`, { headers: req.headers })
         .then(r => r.data)
         .catch(() => null)
     )
   );
-  const combined = responses.reduce(
-    (acc, r) => (r && Array.isArray(r[key]) ? acc.concat(r[key]) : acc),
-    []
-  );
+  const combined = responses.reduce((acc, r) => {
+    if (r && Array.isArray(r[key])) acc.push(...r[key]);
+    return acc;
+  }, []);
   res.json({ [key]: combined });
 });
 
