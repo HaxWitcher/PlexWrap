@@ -4,13 +4,14 @@ const axios   = require('axios');
 const fs      = require('fs');
 const path    = require('path');
 
-// Run from addon folder
+// osiguraj da radimo u folderu gdje je index.js
 process.chdir(path.dirname(__filename));
+
 const app = express();
 
-// CORS for Stremio
+// CORS
 app.use((req, res, next) => {
-  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Origin',  '*');
   res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.set('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
@@ -18,107 +19,173 @@ app.use((req, res, next) => {
 });
 app.use(express.json());
 
-// Config directory
+// Folder u kojem su configA.json, configB.json, …
 const CONFIG_DIR = path.join(__dirname, 'configs');
-const configs = {};
-const wrapperManifests = {};
+const configs = {};          // configName -> { bases, baseManifests }
+const wrapperManifests = {}; // configName -> manifest obj
 
-// Discover config names
+// učitaj sve .json fajlove iz configs/
 const configNames = fs.readdirSync(CONFIG_DIR)
   .filter(f => f.endsWith('.json'))
   .map(f => f.replace(/\.json$/, ''));
 
-// Initialize one config: load bases, fetch manifests, build wrapper
 async function initConfig(name) {
-  const cfgData = JSON.parse(fs.readFileSync(path.join(CONFIG_DIR, `${name}.json`)));
-  const basesRaw = cfgData.TARGET_ADDON_BASES || [];
-  const bases = basesRaw
-    .map(u => u.trim().replace(/\/+$/, '').replace(/\/manifest\\.json$/i, ''))
+  const cfg = JSON.parse(fs.readFileSync(path.join(CONFIG_DIR, `${name}.json`)));
+  let bases = (cfg.TARGET_ADDON_BASES || [])
+    .map(u => u.trim().replace(/\/manifest\.json$/i, '').replace(/\/+$/, ''))
     .filter(Boolean);
 
-  const items = [];
+  // fetch svih manifest.json
   const results = await Promise.allSettled(
     bases.map(b => axios.get(`${b}/manifest.json`))
   );
+  const baseManifests = [];
   results.forEach((r,i) => {
-    if (r.status==='fulfilled' && r.value.data.catalogs) {
-      items.push({ base: bases[i], manifest: r.value.data });
+    if (r.status === 'fulfilled' && Array.isArray(r.value.data.catalogs)) {
+      baseManifests.push({ base: bases[i], manifest: r.value.data });
     }
   });
-  configs[name] = { bases, items };
+  configs[name] = { bases, baseManifests };
 
-  // wrapper manifest
-  const manArr = items.map(it => it.manifest);
+  // složi wrapper manifest
+  const all = baseManifests.map(b => b.manifest);
   wrapperManifests[name] = {
-    id: `stremio-proxy-${name}`,
+    id:    `stremio-proxy-wrapper-${name}`,
     version: '1.0.0',
-    name: `Stremio Proxy (${name})`,
+    name:  `Stremio Proxy Wrapper (${name})`,
     description: 'Proxy svih vaših Stremio addon-a',
     resources: ['catalog','meta','stream','subtitles'],
-    types: [...new Set(manArr.flatMap(m=>m.types||[]))],
-    idPrefixes: [...new Set(manArr.flatMap(m=>m.idPrefixes||[]))],
-    catalogs: manArr.flatMap(m=>m.catalogs||[]),
-    logo: manArr[0]?.logo||'', icon: manArr[0]?.icon||''
+    types: [...new Set(all.flatMap(m=>m.types||[]))],
+    idPrefixes: [...new Set(all.flatMap(m=>m.idPrefixes||[]))],
+    catalogs: all.flatMap(m=>m.catalogs||[]),
+    logo:  all[0]?.logo  || '',
+    icon:  all[0]?.icon  || ''
   };
-  console.log(`✅ [${name}] inicijalizirano: ${bases.length} baza, ${wrapperManifests[name].catalogs.length} kataloga`);
+
+  console.log(`✅ [${name}] inicijaliziran: ${bases.length} baza, ${wrapperManifests[name].catalogs.length} katalog stavki`);
 }
 
-// Init all
-(async()=>{
-  await Promise.all(configNames.map(initConfig));
-  console.log(`🎉 Svi configi spremni: ${configNames.join(', ')}`);
-})();
+Promise.all(configNames.map(initConfig))
+  .then(() => console.log(`🎉 Svi configi spremni: ${configNames.join(', ')}`))
+  .catch(err => {
+    console.error('Greška inicijalizacije:', err);
+    process.exit(1);
+  });
 
-// Serve manifest
-app.get('/:cfg/manifest.json', (req,res) => {
-  const m = wrapperManifests[req.params.cfg];
-  return m
-    ? res.json(m)
-    : res.status(404).json({error:'Config not found'});
+// Serve manifest.json za svaki config
+app.get('/:config/manifest.json', (req, res) => {
+  const m = wrapperManifests[req.params.config];
+  if (!m) return res.status(404).json({ error: 'Config not found' });
+  res.json(m);
 });
 
-// POST handlers
-function makeHandler(key, pathSegment) {
-  return async (req,res) => {
-    const cfg = configs[req.params.cfg];
+// helper za common POST proxy
+function makePost(key) {
+  return async (req, res) => {
+    const conf = req.params.config;
+    const cfg  = configs[conf];
     if (!cfg) return res.json({ [key]: [] });
-    let targets = cfg.items;
-    if (key==='metas') { // catalog
+
+    let targets = cfg.baseManifests;
+
+    // za katalog filtriraj samo po id koje je Stremio tražio
+    if (key === 'metas') {
       const id = req.body.id;
-      targets = targets.filter(it => it.manifest.catalogs.some(c=>c.id===id));
+      targets = targets.filter(bm => bm.manifest.catalogs.some(c=>c.id===id));
     }
-    const calls = targets.map(it =>
-      axios.post(`${it.base}/${pathSegment}`, req.body, {headers:{'Content-Type':'application/json'}})
-        .then(r=>r.data).catch(()=>null)
+
+    const arr = await Promise.all(
+      targets.map(bm =>
+        axios.post(`${bm.base}/${ key==='metas' ? 'catalog' : key }`,
+                   req.body,
+                   { headers:{ 'Content-Type':'application/json' } })
+             .then(r=>r.data)
+             .catch(()=>null)
+      )
     );
-    const resArr = await Promise.all(calls);
-    const combined = resArr.reduce((acc,r)=>{
-      if (!r) return acc;
-      const arr = r[key] || [];
-      return acc.concat(arr);
+    const combined = arr.reduce((acc, r) => {
+      if (r && Array.isArray(r[key])) acc.push(...r[key]);
+      return acc;
     }, []);
     res.json({ [key]: combined });
-  }
+  };
 }
-app.post('/:cfg/catalog',   makeHandler('metas','catalog'));
-app.post('/:cfg/meta',      makeHandler('metas','meta'));
-app.post('/:cfg/stream',    makeHandler('streams','stream'));
-app.post('/:cfg/subtitles', makeHandler('subtitles','subtitles'));
 
-// GET fallback → convert GET /:cfg/catalog/... to POST catalog
-app.get('/:cfg/:path(*)', async (req,res) => {
-  const {cfg, path: pth} = req.params;
-  if (pth.startsWith('catalog/')) {
-    // emulate POST catalog
-    const parts = pth.split('/');
-    const body = { id: parts[2]?.replace('.json',''), extra: {} };
-    return makeHandler('metas','catalog')(Object.assign(req, { body }), res);
-  }
-  if (pth.startsWith('stream/'))    return makeHandler('streams','stream')(req,res);
-  if (pth.startsWith('subtitles/')) return makeHandler('subtitles','subtitles')(req,res);
-  return res.status(404).json({ error:'Not found' });
+app.post('/:config/catalog',    makePost('metas'));
+app.post('/:config/meta',       makePost('metas'));
+app.post('/:config/stream',     makePost('streams'));
+app.post('/:config/subtitles',  makePost('subtitles'));
+
+// ==== EXPLICIT GET-fallback handlers ====
+
+// GET /:config/catalog/:type/:catalogId.json  → POST /catalog
+app.get('/:config/catalog/:type/:catalogId.json', async (req, res) => {
+  const { config, type, catalogId } = req.params;
+  const cfg = configs[config];
+  if (!cfg) return res.status(404).json({ metas: [] });
+
+  const targets = cfg.baseManifests.filter(bm =>
+    bm.manifest.catalogs.some(c => c.id === catalogId)
+  );
+  if (!targets.length) return res.json({ metas: [] });
+
+  const body = { id: catalogId, type, extra: {}, skip: 0 };
+  const arr = await Promise.all(
+    targets.map(bm =>
+      axios.post(`${bm.base}/catalog`, body, { headers:{ 'Content-Type':'application/json' } })
+           .then(r=>r.data)
+           .catch(()=>null)
+    )
+  );
+  const metas = arr.reduce((acc, r) => {
+    if (r && Array.isArray(r.metas)) acc.push(...r.metas);
+    return acc;
+  }, []);
+  res.json({ metas });
 });
 
-// Listen
-const PORT = process.env.PORT||7000;
-app.listen(PORT, ()=> console.log(`🔌 Listening on :${PORT}`));
+// GET /:config/stream/:type/:videoId.json → POST /stream
+app.get('/:config/stream/:type/:videoId.json', async (req, res) => {
+  const { config, type, videoId } = req.params;
+  const cfg = configs[config];
+  if (!cfg) return res.status(404).json({ streams: [] });
+
+  const body = { id: videoId, type };
+  const arr = await Promise.all(
+    cfg.baseManifests.map(bm =>
+      axios.post(`${bm.base}/stream`, body, { headers:{ 'Content-Type':'application/json' } })
+           .then(r=>r.data)
+           .catch(()=>null)
+    )
+  );
+  const streams = arr.reduce((acc, r) => {
+    if (r && Array.isArray(r.streams)) acc.push(...r.streams);
+    return acc;
+  }, []);
+  res.json({ streams });
+});
+
+// GET /:config/subtitles/:type/:videoId.json → POST /subtitles
+app.get('/:config/subtitles/:type/:videoId.json', async (req, res) => {
+  const { config, type, videoId } = req.params;
+  const cfg = configs[config];
+  if (!cfg) return res.status(404).json({ subtitles: [] });
+
+  const body = { id: videoId, type };
+  const arr = await Promise.all(
+    cfg.baseManifests.map(bm =>
+      axios.post(`${bm.base}/subtitles`, body, { headers:{ 'Content-Type':'application/json' } })
+           .then(r=>r.data)
+           .catch(()=>null)
+    )
+  );
+  const subtitles = arr.reduce((acc, r) => {
+    if (r && Array.isArray(r.subtitles)) acc.push(...r.subtitles);
+    return acc;
+  }, []);
+  res.json({ subtitles });
+});
+
+// start server
+const PORT = process.env.PORT || 7000;
+app.listen(PORT, () => console.log(`🔌 Listening on :${PORT}`));
