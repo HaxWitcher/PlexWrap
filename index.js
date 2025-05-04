@@ -7,8 +7,6 @@ const path    = require('path');
 // Osiguraj da radimo iz direktorijuma gde je ovaj fajl
 process.chdir(path.dirname(__filename));
 
-const BASE_URL = process.env.BASE_URL || 'http://vps-3066ce66.vps.ovh.net';
-
 const app = express();
 
 // CORS i parsiranje JSON tela
@@ -21,39 +19,6 @@ app.use((req, res, next) => {
 });
 app.use(express.json());
 
-// --- Proxy ruta za video iz Config B ---------------------------------------
-app.get('/:config/proxy', async (req, res) => {
-  const cfg = req.params.config;
-  if (cfg !== 'configB') {
-    return res.status(403).send('Forbidden');
-  }
-  const target = req.query.url;
-  if (!target) {
-    return res.status(400).send('Missing url param');
-  }
-  try {
-    const headers = {};
-    if (req.headers.range) {
-      headers.Range = req.headers.range;
-    }
-    const resp = await axios.get(target, {
-      responseType: 'stream',
-      headers
-    });
-    res.status(resp.status);
-    ['content-type','content-length','accept-ranges','content-range']
-      .forEach(h => {
-        if (resp.headers[h]) {
-          res.setHeader(h, resp.headers[h]);
-        }
-      });
-    resp.data.pipe(res);
-  } catch (err) {
-    console.error('Proxy error:', err.message);
-    res.sendStatus(502);
-  }
-});
-
 // --- Učitavanje config fajlova ----------------------------------------------
 const CONFIG_DIR  = path.join(__dirname, 'configs');
 const configFiles = fs.existsSync(CONFIG_DIR)
@@ -62,7 +27,7 @@ const configFiles = fs.existsSync(CONFIG_DIR)
 const configNames = configFiles.map(f => f.replace(/\.json$/, ''));
 
 // Ovde čuvamo po-config listu baza i generisane manifest-e
-const configs          = {}; // configs[ime] = [ { base, manifest }, … ]
+const configs          = {}; // configs[ime] = [ { base, manifest }, ... ]
 const wrapperManifests = {}; // wrapperManifests[ime] = spojen manifest
 
 async function initConfig(name) {
@@ -75,6 +40,7 @@ async function initConfig(name) {
     return;
   }
 
+  // Normalizuj i ukloni duplikate iz TARGET_ADDON_BASES
   const bases = Array.from(new Set(
     (cfg.TARGET_ADDON_BASES || [])
       .map(u => u.trim()
@@ -83,6 +49,7 @@ async function initConfig(name) {
       .filter(Boolean)
   ));
 
+  // Fetch-uj svaki manifest
   const results = await Promise.allSettled(
     bases.map(b => axios.get(`${b}/manifest.json`))
   );
@@ -102,6 +69,7 @@ async function initConfig(name) {
     return;
   }
 
+  // Pravi "wrapper" manifest za ovaj config
   const manifests = baseManifests.map(bm => bm.manifest);
   const wrapper = {
     manifestVersion: '4',
@@ -121,6 +89,7 @@ async function initConfig(name) {
   console.log(`✅ [${name}] inicijalizovano: ${baseManifests.length} baza, ${wrapper.catalogs.length} kataloga`);
 }
 
+// Inicijalizuj sve configuracije
 Promise.all(configNames.map(initConfig))
   .then(() => console.log(`🎉 Svi config-i spremni: ${configNames.join(', ')}`))
   .catch(err => console.error('❌ Greška pri inicijalizaciji:', err));
@@ -139,6 +108,7 @@ function makeHandler(key, endpoint) {
     const bases = configs[name] || [];
     if (!bases.length) return res.json({ [key]: [] });
 
+    // za katalog filtriraj po id-u kataloga
     let targets = bases;
     if (key === 'metas') {
       const id = req.body.id;
@@ -155,7 +125,8 @@ function makeHandler(key, endpoint) {
       )
     );
 
-    let combined = [];
+    // spoji rezultate
+    const combined = [];
     results.forEach(r => {
       if (r.status === 'fulfilled' &&
           r.value.data &&
@@ -163,17 +134,6 @@ function makeHandler(key, endpoint) {
         combined.push(...r.value.data[key]);
       }
     });
-
-    // Ako je Config B i stream handler, prepakuj URL-ove kroz proxy
-    if (key === 'streams' && name === 'configB') {
-      combined = combined.map(s => {
-        if (s.url) {
-          s.url = `${BASE_URL}/${name}/proxy?url=${encodeURIComponent(s.url)}`;
-        }
-        return s;
-      });
-    }
-
     res.json({ [key]: combined });
   };
 }
@@ -191,11 +151,12 @@ app.get('/:config/:path(*)', async (req, res) => {
 
   const route = req.params.path;
   let key;
-  if (route.startsWith('catalog/'))       key = 'metas';
-  else if (route.startsWith('stream/'))   key = 'streams';
+  if (route.startsWith('catalog/'))     key = 'metas';
+  else if (route.startsWith('stream/'))  key = 'streams';
   else if (route.startsWith('subtitles/')) key = 'subtitles';
   else return res.status(404).json({ error: 'Nije pronađeno' });
 
+  // za katalog GET filtriraj po id-u
   let targets = bases;
   if (key === 'metas') {
     const parts = route.split('/');
