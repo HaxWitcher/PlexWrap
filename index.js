@@ -7,6 +7,8 @@ const path    = require('path');
 // Osiguraj da radimo iz direktorijuma gde je ovaj fajl
 process.chdir(path.dirname(__filename));
 
+const BASE_URL = process.env.BASE_URL || 'http://vps-3066ce66.vps.ovh.net';
+
 const app = express();
 
 // CORS i parsiranje JSON tela
@@ -19,9 +21,38 @@ app.use((req, res, next) => {
 });
 app.use(express.json());
 
-// --- HOST za proxy streamova ------------------------------------------------
-const HOST = process.env.HOST_URL || 'http://tvoj-vps-domain'; 
-// Postavi HOST_URL=u .env na npr. https://moj-vps.example.com
+// --- Proxy ruta za video iz Config B ---------------------------------------
+app.get('/:config/proxy', async (req, res) => {
+  const cfg = req.params.config;
+  if (cfg !== 'configB') {
+    return res.status(403).send('Forbidden');
+  }
+  const target = req.query.url;
+  if (!target) {
+    return res.status(400).send('Missing url param');
+  }
+  try {
+    const headers = {};
+    if (req.headers.range) {
+      headers.Range = req.headers.range;
+    }
+    const resp = await axios.get(target, {
+      responseType: 'stream',
+      headers
+    });
+    res.status(resp.status);
+    ['content-type','content-length','accept-ranges','content-range']
+      .forEach(h => {
+        if (resp.headers[h]) {
+          res.setHeader(h, resp.headers[h]);
+        }
+      });
+    resp.data.pipe(res);
+  } catch (err) {
+    console.error('Proxy error:', err.message);
+    res.sendStatus(502);
+  }
+});
 
 // --- Učitavanje config fajlova ----------------------------------------------
 const CONFIG_DIR  = path.join(__dirname, 'configs');
@@ -30,10 +61,9 @@ const configFiles = fs.existsSync(CONFIG_DIR)
   : [];
 const configNames = configFiles.map(f => f.replace(/\.json$/, ''));
 
-// Po-config skladište
-const configs          = {}; // configs[name] = [ { base, manifest }, ... ]
-const wrapperManifests = {}; // wrapperManifests[name] = spojen manifest
-const configSettings   = {}; // configSettings[name] = { proxyStreams: boolean }
+// Ovde čuvamo po-config listu baza i generisane manifest-e
+const configs          = {}; // configs[ime] = [ { base, manifest }, … ]
+const wrapperManifests = {}; // wrapperManifests[ime] = spojen manifest
 
 async function initConfig(name) {
   const file = path.join(CONFIG_DIR, name + '.json');
@@ -45,12 +75,6 @@ async function initConfig(name) {
     return;
   }
 
-  // Sačuvaj podešavanje proxy-ja streamova
-  configSettings[name] = {
-    proxyStreams: cfg.PROXY_STREAMS === true
-  };
-
-  // Normalizuj i ukloni duplikate iz TARGET_ADDON_BASES
   const bases = Array.from(new Set(
     (cfg.TARGET_ADDON_BASES || [])
       .map(u => u.trim()
@@ -59,7 +83,6 @@ async function initConfig(name) {
       .filter(Boolean)
   ));
 
-  // Fetch manifest-e
   const results = await Promise.allSettled(
     bases.map(b => axios.get(`${b}/manifest.json`))
   );
@@ -79,7 +102,6 @@ async function initConfig(name) {
     return;
   }
 
-  // Pravi "wrapper" manifest
   const manifests = baseManifests.map(bm => bm.manifest);
   const wrapper = {
     manifestVersion: '4',
@@ -99,7 +121,6 @@ async function initConfig(name) {
   console.log(`✅ [${name}] inicijalizovano: ${baseManifests.length} baza, ${wrapper.catalogs.length} kataloga`);
 }
 
-// Inicijalizuj sve konfiguracije
 Promise.all(configNames.map(initConfig))
   .then(() => console.log(`🎉 Svi config-i spremni: ${configNames.join(', ')}`))
   .catch(err => console.error('❌ Greška pri inicijalizaciji:', err));
@@ -114,11 +135,10 @@ app.get('/:config/manifest.json', (req, res) => {
 // --- POST handleri za katalog, meta, stream i subtitles ---------------------
 function makeHandler(key, endpoint) {
   return async (req, res) => {
-    const name  = req.params.config;
+    const name = req.params.config;
     const bases = configs[name] || [];
     if (!bases.length) return res.json({ [key]: [] });
 
-    // za katalog filtriraj po id-u kataloga
     let targets = bases;
     if (key === 'metas') {
       const id = req.body.id;
@@ -135,8 +155,7 @@ function makeHandler(key, endpoint) {
       )
     );
 
-    // spoji rezultate
-    const combined = [];
+    let combined = [];
     results.forEach(r => {
       if (r.status === 'fulfilled' &&
           r.value.data &&
@@ -145,13 +164,13 @@ function makeHandler(key, endpoint) {
       }
     });
 
-    // Ako je ovo stream i proxy je uključen, prepiši URL-ove
-    if (key === 'streams' && configSettings[name]?.proxyStreams) {
-      combined.forEach(s => {
+    // Ako je Config B i stream handler, prepakuj URL-ove kroz proxy
+    if (key === 'streams' && name === 'configB') {
+      combined = combined.map(s => {
         if (s.url) {
-          const enc = encodeURIComponent(s.url);
-          s.url = `${HOST}/${name}/proxy?target=${enc}`;
+          s.url = `${BASE_URL}/${name}/proxy?url=${encodeURIComponent(s.url)}`;
         }
+        return s;
       });
     }
 
@@ -166,18 +185,17 @@ app.post('/:config/subtitles', makeHandler('subtitles', 'subtitles'));
 
 // --- GET fallback za v3 kompatibilnost -------------------------------------
 app.get('/:config/:path(*)', async (req, res) => {
-  const name  = req.params.config;
+  const name = req.params.config;
   const bases = configs[name] || [];
   if (!bases.length) return res.status(404).json({ error: 'Config nije pronađen' });
 
   const route = req.params.path;
   let key;
-  if (route.startsWith('catalog/'))      key = 'metas';
+  if (route.startsWith('catalog/'))       key = 'metas';
   else if (route.startsWith('stream/'))   key = 'streams';
   else if (route.startsWith('subtitles/')) key = 'subtitles';
   else return res.status(404).json({ error: 'Nije pronađeno' });
 
-  // za katalog GET filtriraj po id-u
   let targets = bases;
   if (key === 'metas') {
     const parts = route.split('/');
@@ -199,29 +217,6 @@ app.get('/:config/:path(*)', async (req, res) => {
     }
   });
   res.json({ [key]: combined });
-});
-
-// --- Proxy endpoint za streamove --------------------------------------------
-app.get('/:config/proxy', async (req, res) => {
-  const name   = req.params.config;
-  if (!configSettings[name]?.proxyStreams) {
-    return res.status(404).send('Proxy nije omogućen za ovaj config');
-  }
-  const tgt = req.query.target;
-  if (!tgt) return res.status(400).send('Nedostaje target parametar');
-  try {
-    const response = await axios.get(decodeURIComponent(tgt), {
-      responseType: 'stream'
-    });
-    // prenesi zaglavlja
-    Object.entries(response.headers).forEach(([k, v]) => {
-      res.setHeader(k, v);
-    });
-    response.data.pipe(res);
-  }
-  catch (e) {
-    res.status(502).send('Bad Gateway');
-  }
 });
 
 // Startovanje servera
