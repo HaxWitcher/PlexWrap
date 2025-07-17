@@ -44,7 +44,7 @@ async function initConfig(name) {
   const bases = Array.from(new Set(
     (cfg.TARGET_ADDON_BASES || [])
       .map(u => u.trim()
-                 .replace(/\/manifest\.json$/i,'')
+                 .replace(/\/manifest\\.json$/i,'')
                  .replace(/\/+$/,''))
       .filter(Boolean)
   ));
@@ -69,7 +69,7 @@ async function initConfig(name) {
     return;
   }
 
-  // Pravi "wrapper" manifest za ovaj config
+  // Pravi "wrapper" manifest za ovaj config, sa Channels podrškom
   const manifests = baseManifests.map(bm => bm.manifest);
   const wrapper = {
     manifestVersion: '4',
@@ -77,16 +77,18 @@ async function initConfig(name) {
     version:         '1.0.0',
     name:            `Stremio Proxy Wrapper (${name})`,
     description:     'Proxy svih vaših Stremio addon-a',
-    resources:       ['catalog','meta','stream','subtitles'],
+    resources:       ['catalog','meta','stream','subtitles','channels'],
     types:           Array.from(new Set(manifests.flatMap(m => m.types  || []))),
     idPrefixes:      Array.from(new Set(manifests.flatMap(m => m.idPrefixes || []))),
     catalogs:        manifests.flatMap(m => m.catalogs || []),
+    channels:        manifests.flatMap(m => m.channels || []),
     logo:            manifests[0].logo || '',
     icon:            manifests[0].icon || ''
   };
 
   wrapperManifests[name] = wrapper;
-  console.log(`✅ [${name}] inicijalizovano: ${baseManifests.length} baza, ${wrapper.catalogs.length} kataloga`);
+  console.log(`✅ [${name}] inicijalizovano: ${baseManifests.length} baza, ` +
+              `${wrapper.catalogs.length} kataloga, ${wrapper.channels.length} kanala`);
 }
 
 // Inicijalizuj sve configuracije
@@ -101,14 +103,31 @@ app.get('/:config/manifest.json', (req, res) => {
   res.json(w);
 });
 
-// --- POST handleri za katalog, meta, stream i subtitles ---------------------
+// --- GET handler za Channels -----------------------------------------------
+app.get('/:config/channels', async (req, res) => {
+  const name = req.params.config;
+  const bases = configs[name] || [];
+  if (!bases.length) return res.json({ channels: [] });
+
+  const results = await Promise.allSettled(
+    bases.map(bm => axios.get(`${bm.base}/channels`))
+  );
+  const combined = [];
+  results.forEach(r => {
+    if (r.status === 'fulfilled' && r.value.data && Array.isArray(r.value.data.channels)) {
+      combined.push(...r.value.data.channels);
+    }
+  });
+  res.json({ channels: combined });
+});
+
+// --- POST handleri za katalog, meta, stream, subtitles i channels ------------
 function makeHandler(key, endpoint) {
   return async (req, res) => {
     const name = req.params.config;
     const bases = configs[name] || [];
     if (!bases.length) return res.json({ [key]: [] });
 
-    // za katalog filtriraj po id-u kataloga
     let targets = bases;
     if (key === 'metas') {
       const id = req.body.id;
@@ -125,7 +144,6 @@ function makeHandler(key, endpoint) {
       )
     );
 
-    // spoji rezultate
     const combined = [];
     results.forEach(r => {
       if (r.status === 'fulfilled' &&
@@ -142,6 +160,7 @@ app.post('/:config/catalog',   makeHandler('metas',     'catalog'));
 app.post('/:config/meta',      makeHandler('metas',     'meta'));
 app.post('/:config/stream',    makeHandler('streams',   'stream'));
 app.post('/:config/subtitles', makeHandler('subtitles', 'subtitles'));
+app.post('/:config/channels',  makeHandler('channels',  'channels'));
 
 // --- GET fallback za v3 kompatibilnost -------------------------------------
 app.get('/:config/:path(*)', async (req, res) => {
@@ -151,12 +170,12 @@ app.get('/:config/:path(*)', async (req, res) => {
 
   const route = req.params.path;
   let key;
-  if (route.startsWith('catalog/'))     key = 'metas';
-  else if (route.startsWith('stream/'))  key = 'streams';
-  else if (route.startsWith('subtitles/')) key = 'subtitles';
+  if (route.startsWith('catalog/'))       key = 'metas';
+  else if (route.startsWith('stream/'))   key = 'streams';
+  else if (route.startsWith('subtitles/'))key = 'subtitles';
+  else if (route.startsWith('channels'))  key = 'channels';
   else return res.status(404).json({ error: 'Nije pronađeno' });
 
-  // za katalog GET filtriraj po id-u
   let targets = bases;
   if (key === 'metas') {
     const parts = route.split('/');
