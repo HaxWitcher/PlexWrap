@@ -69,7 +69,7 @@ async function initConfig(name) {
     return;
   }
 
-  // Pravi "wrapper" manifest za ovaj config, sa Channels podrškom
+  // Pravi "wrapper" manifest za ovaj config, uz Channels podršku
   const manifests = baseManifests.map(bm => bm.manifest);
   const wrapper = {
     manifestVersion: '4',
@@ -81,14 +81,12 @@ async function initConfig(name) {
     types:           Array.from(new Set(manifests.flatMap(m => m.types  || []))),
     idPrefixes:      Array.from(new Set(manifests.flatMap(m => m.idPrefixes || []))),
     catalogs:        manifests.flatMap(m => m.catalogs || []),
-    channels:        manifests.flatMap(m => m.channels || []),
     logo:            manifests[0].logo || '',
     icon:            manifests[0].icon || ''
   };
 
   wrapperManifests[name] = wrapper;
-  console.log(`✅ [${name}] inicijalizovano: ${baseManifests.length} baza, ` +
-              `${wrapper.catalogs.length} kataloga, ${wrapper.channels.length} kanala`);
+  console.log(`✅ [${name}] inicijalizovano: ${baseManifests.length} baza, ${wrapper.catalogs.length} kataloga`);
 }
 
 // Inicijalizuj sve configuracije
@@ -103,31 +101,41 @@ app.get('/:config/manifest.json', (req, res) => {
   res.json(w);
 });
 
-// --- GET handler za Channels -----------------------------------------------
+// --- GET handler za Channels katalog --------------------------------------
 app.get('/:config/channels', async (req, res) => {
   const name = req.params.config;
   const bases = configs[name] || [];
   if (!bases.length) return res.json({ channels: [] });
 
-  const results = await Promise.allSettled(
-    bases.map(bm => axios.get(`${bm.base}/channels`))
-  );
   const combined = [];
-  results.forEach(r => {
-    if (r.status === 'fulfilled' && r.value.data && Array.isArray(r.value.data.channels)) {
-      combined.push(...r.value.data.channels);
+  for (const bm of bases) {
+    const channelCatalogs = (bm.manifest.catalogs || []).filter(c => c.type === 'channel');
+    for (const cat of channelCatalogs) {
+      try {
+        const r = await axios.post(
+          `${bm.base}/catalog`,
+          { id: cat.id },
+          { headers: { 'Content-Type': 'application/json' } }
+        );
+        if (r.data && Array.isArray(r.data.metas)) {
+          combined.push(...r.data.metas);
+        }
+      } catch (e) {
+        console.warn(`⚠️  [${name}] fetch channels iz ${bm.base} (${cat.id}) nije uspeo`);
+      }
     }
-  });
+  }
   res.json({ channels: combined });
 });
 
-// --- POST handleri za katalog, meta, stream, subtitles i channels ------------
+// --- POST handleri za katalog, meta, stream i subtitles ---------------------
 function makeHandler(key, endpoint) {
   return async (req, res) => {
     const name = req.params.config;
     const bases = configs[name] || [];
     if (!bases.length) return res.json({ [key]: [] });
 
+    // za katalog filtriraj po id-u kataloga
     let targets = bases;
     if (key === 'metas') {
       const id = req.body.id;
@@ -160,7 +168,6 @@ app.post('/:config/catalog',   makeHandler('metas',     'catalog'));
 app.post('/:config/meta',      makeHandler('metas',     'meta'));
 app.post('/:config/stream',    makeHandler('streams',   'stream'));
 app.post('/:config/subtitles', makeHandler('subtitles', 'subtitles'));
-app.post('/:config/channels',  makeHandler('channels',  'channels'));
 
 // --- GET fallback za v3 kompatibilnost -------------------------------------
 app.get('/:config/:path(*)', async (req, res) => {
@@ -173,9 +180,9 @@ app.get('/:config/:path(*)', async (req, res) => {
   if (route.startsWith('catalog/'))       key = 'metas';
   else if (route.startsWith('stream/'))   key = 'streams';
   else if (route.startsWith('subtitles/'))key = 'subtitles';
-  else if (route.startsWith('channels'))  key = 'channels';
   else return res.status(404).json({ error: 'Nije pronađeno' });
 
+  // za katalog GET filtriraj po id-u
   let targets = bases;
   if (key === 'metas') {
     const parts = route.split('/');
