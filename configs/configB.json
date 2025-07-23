@@ -1,5 +1,6 @@
 {
   "TARGET_ADDON_BASES": [
+    "https://stremio-ratings-v3-production.up.railway.app",
     "https://1fe84bc728af-stremio-mdblist.baby-beamup.club/filmovi-2025/userapi-haxwitcher-qnyima1bbkfwlf2acap4wsidw",
     "https://1fe84bc728af-stremio-mdblist.baby-beamup.club/serije-sa-originalnim-prevodom/userapi-haxwitcher-qnyima1bbkfwlf2acap4wsidw",
     "https://1fe84bc728af-stremio-mdblist.baby-beamup.club/svi-filmovi-sa-originalnim-prevodom/userapi-haxwitcher-qnyima1bbkfwlf2acap4wsidw",
