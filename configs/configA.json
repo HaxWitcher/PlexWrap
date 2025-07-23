@@ -1,5 +1,6 @@
 {
   "TARGET_ADDON_BASES": [
+    "https://stremio-ratings-v3-production.up.railway.app",
     "https://1fe84bc728af-stremio-mdblist.baby-beamup.club/94832/qnyima1bbkfwlf2acap4wsidw/t3-b10a29cb-3baa-4b50-acb2-537117debdb6",
     "https://1fe84bc728af-stremio-mdblist.baby-beamup.club/94840/qnyima1bbkfwlf2acap4wsidw/t3-b10a29cb-3baa-4b50-acb2-537117debdb6",
     "https://1fe84bc728af-stremio-mdblist.baby-beamup.club/94848/qnyima1bbkfwlf2acap4wsidw/t3-b10a29cb-3baa-4b50-acb2-537117debdb6",
