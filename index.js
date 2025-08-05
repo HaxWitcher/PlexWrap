@@ -74,7 +74,7 @@ async function initConfig(name) {
   const wrapper = {
     manifestVersion: '4',
     id:              `stremio-proxy-wrapper-${name}`,
-    version:         '1.1.0',
+    version:         '1.2.0',
     name:            `Stremio Proxy Wrapper (${name})`,
     description:     'Proxy svih vaših Stremio addon-a',
     resources:       ['catalog','meta','stream','subtitles'],
