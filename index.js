@@ -89,15 +89,29 @@ async function initConfig(name) {
   console.log(`✅ [${name}] inicijalizovano: ${baseManifests.length} baza, ${wrapper.catalogs.length} kataloga`);
 }
 
-// Inicijalizuj sve configuracije
+// Inicijalizuj sve konfiguracije
 Promise.all(configNames.map(initConfig))
   .then(() => console.log(`🎉 Svi config-i spremni: ${configNames.join(', ')}`))
   .catch(err => console.error('❌ Greška pri inicijalizaciji:', err));
+
+// 🔁 Automatsko osvežavanje svakih 15 minuta
+setInterval(() => {
+  configNames.forEach(name => {
+    console.log(`♻️ Osvježavam config: ${name}`);
+    initConfig(name);
+  });
+}, 15 * 60 * 1000);
 
 // --- Ruta za manifest -------------------------------------------------------
 app.get('/:config/manifest.json', (req, res) => {
   const w = wrapperManifests[req.params.config];
   if (!w) return res.status(404).json({ error: 'Config nije pronađen' });
+
+  // 🚫 Spreči keširanje
+  res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+
   res.json(w);
 });
 
@@ -151,8 +165,8 @@ app.get('/:config/:path(*)', async (req, res) => {
 
   const route = req.params.path;
   let key;
-  if (route.startsWith('catalog/'))     key = 'metas';
-  else if (route.startsWith('stream/'))  key = 'streams';
+  if (route.startsWith('catalog/'))        key = 'metas';
+  else if (route.startsWith('stream/'))    key = 'streams';
   else if (route.startsWith('subtitles/')) key = 'subtitles';
   else return res.status(404).json({ error: 'Nije pronađeno' });
 
@@ -177,6 +191,12 @@ app.get('/:config/:path(*)', async (req, res) => {
       combined.push(...r.value.data[key]);
     }
   });
+
+  // 🚫 Spreči keširanje i za GET fallback
+  res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+
   res.json({ [key]: combined });
 });
 
